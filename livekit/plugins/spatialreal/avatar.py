@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from avatarkit import (
     AvatarSession as AvatarkitSession,
@@ -55,6 +56,8 @@ class AvatarSession:
         ingress_endpoint_url: Ingress endpoint URL. Falls back to
             SPATIALREAL_INGRESS_ENDPOINT env var or default.
         avatar_participant_identity: LiveKit identity for the avatar participant.
+        idle_timeout_seconds: Idle timeout in seconds for the egress connection.
+            A value of 0 uses server defaults.
 
     Usage:
         avatar = AvatarSession()
@@ -70,6 +73,7 @@ class AvatarSession:
         console_endpoint_url: str | None = None,
         ingress_endpoint_url: str | None = None,
         avatar_participant_identity: str | None = None,
+        idle_timeout_seconds: int = 0,
     ) -> None:
         # Resolve API key
         self._api_key = api_key or os.getenv("SPATIALREAL_API_KEY")
@@ -100,6 +104,10 @@ class AvatarSession:
 
         # Avatar participant configuration
         self._avatar_participant_identity = avatar_participant_identity or DEFAULT_AVATAR_PARTICIPANT_IDENTITY
+
+        if idle_timeout_seconds < 0:
+            raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
+        self._idle_timeout_seconds = idle_timeout_seconds
 
         # Internal state
         self._avatarkit_session: AvatarkitSession | None = None
@@ -145,18 +153,24 @@ class AvatarSession:
             )
 
         room_name = room.name
+        agent_participant_identity = room.local_participant.identity
         logger.info(f"Initializing SpatialReal avatar session for room: {room_name}")
         logger.debug(f"Console endpoint: {self._console_endpoint_url}")
         logger.debug(f"Ingress endpoint: {self._ingress_endpoint_url}")
 
+        egress_attributes = {"lk.publish_on_behalf": agent_participant_identity}
+
         # Create LiveKit egress configuration for the avatar to join the room
-        livekit_egress = LiveKitEgressConfig(
-            url=lk_url,
-            api_key=lk_api_key,
-            api_secret=lk_api_secret,
-            room_name=room_name,
-            publisher_id=self._avatar_participant_identity,
-        )
+        livekit_egress_kwargs: dict[str, Any] = {
+            "url": lk_url,
+            "api_key": lk_api_key,
+            "api_secret": lk_api_secret,
+            "room_name": room_name,
+            "publisher_id": self._avatar_participant_identity,
+            "extra_attributes": egress_attributes,
+            "idle_timeout": self._idle_timeout_seconds,
+        }
+        livekit_egress = LiveKitEgressConfig(**livekit_egress_kwargs)
 
         # Create avatar session with LiveKit egress mode
         self._avatarkit_session = new_avatar_session(

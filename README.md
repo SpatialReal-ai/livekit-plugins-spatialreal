@@ -87,11 +87,15 @@ Main class for integrating SpatialReal avatars with LiveKit agents.
 | `console_endpoint_url` | `str` | Custom console endpoint URL |
 | `ingress_endpoint_url` | `str` | Custom ingress endpoint URL |
 | `avatar_participant_identity` | `str` | LiveKit identity for avatar participant |
+| `idle_timeout_seconds` | `int` | LiveKit egress idle timeout in seconds (`0` uses server defaults) |
 
 #### Methods
 
 - `start(agent_session, room, *, livekit_url, livekit_api_key, livekit_api_secret)`: Start the avatar session and hook into the agent's audio output.
 - `aclose()`: Clean up avatar session resources.
+
+When starting, the plugin automatically sets `lk.publish_on_behalf` to the
+agent participant identity for avatar worker association in LiveKit frontends.
 
 ### `SpatialRealException`
 
