@@ -71,6 +71,16 @@ if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
 ```
 
+For production agents, catch `SpatialRealException` so you can decide whether to fail the job or continue without avatar output:
+
+```python
+try:
+    await avatar.start(session, room=ctx.room)
+except spatialreal.SpatialRealException as err:
+    logger.error("Avatar startup failed: %s", err)
+    raise
+```
+
 ## API Reference
 
 ### `AvatarSession`
@@ -91,7 +101,7 @@ Main class for integrating SpatialReal avatars with LiveKit agents.
 
 #### Methods
 
-- `start(agent_session, room, *, livekit_url, livekit_api_key, livekit_api_secret)`: Start the avatar session and hook into the agent's audio output.
+- `start(agent_session, room, *, livekit_url, livekit_api_key, livekit_api_secret, sample_rate=None)`: Start the avatar session and hook into the agent's audio output. Raises `SpatialRealException` with actionable context if startup fails.
 - `aclose()`: Clean up avatar session resources.
 
 When starting, the plugin automatically sets `lk.publish_on_behalf` to the
