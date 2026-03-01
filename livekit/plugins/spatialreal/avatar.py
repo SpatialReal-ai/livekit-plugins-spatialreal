@@ -113,6 +113,8 @@ class AvatarSession:
         self._avatarkit_session: AvatarkitSession | None = None
         self._agent_session: AgentSession | None = None
         self._audio_buffer: QueueAudioOutput | None = None
+        self._original_audio_output: Any | None = None
+        self._audio_output_attached = False
         self._main_task: asyncio.Task | None = None
         self._initialized = False
 
@@ -124,6 +126,7 @@ class AvatarSession:
         livekit_url: str | None = None,
         livekit_api_key: str | None = None,
         livekit_api_secret: str | None = None,
+        sample_rate: int | None = None,
     ) -> None:
         """
         Start the avatar session and hook into the agent session.
@@ -134,12 +137,12 @@ class AvatarSession:
             livekit_url: LiveKit server URL. Falls back to LIVEKIT_URL env var.
             livekit_api_key: LiveKit API key. Falls back to LIVEKIT_API_KEY env var.
             livekit_api_secret: LiveKit API secret. Falls back to LIVEKIT_API_SECRET env var.
+            sample_rate: Optional audio sample rate override for avatar audio.
+                Falls back to agent_session.tts.sample_rate or a default value.
         """
         if self._initialized:
             logger.warning("Avatar session already initialized")
             return
-
-        self._agent_session = agent_session
 
         # Resolve LiveKit credentials
         lk_url = livekit_url or os.getenv("LIVEKIT_URL")
@@ -172,53 +175,111 @@ class AvatarSession:
         }
         livekit_egress = LiveKitEgressConfig(**livekit_egress_kwargs)
 
-        # Create avatar session with LiveKit egress mode
-        self._avatarkit_session = new_avatar_session(
-            api_key=self._api_key,
-            app_id=self._app_id,
-            avatar_id=self._avatar_id,
-            console_endpoint_url=self._console_endpoint_url,
-            ingress_endpoint_url=self._ingress_endpoint_url,
-            expire_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            livekit_egress=livekit_egress,
-        )
+        resolved_sample_rate = sample_rate
+        if resolved_sample_rate is None:
+            resolved_sample_rate = agent_session.tts.sample_rate if agent_session.tts else DEFAULT_SAMPLE_RATE
+        if resolved_sample_rate <= 0:
+            raise SpatialRealException("sample_rate must be greater than 0")
 
-        # Initialize and start the avatar session
-        await self._avatarkit_session.init()
-        await self._avatarkit_session.start()
-        logger.info("SpatialReal avatar session connected")
+        self._agent_session = agent_session
+        self._original_audio_output = agent_session.output.audio
 
-        # Create audio buffer using livekit-agents' QueueAudioOutput
-        sample_rate = agent_session.tts.sample_rate if agent_session.tts else DEFAULT_SAMPLE_RATE
-        self._audio_buffer = QueueAudioOutput(sample_rate=sample_rate)
+        try:
+            # Create avatar session with LiveKit egress mode
+            self._avatarkit_session = new_avatar_session(
+                api_key=self._api_key,
+                app_id=self._app_id,
+                avatar_id=self._avatar_id,
+                console_endpoint_url=self._console_endpoint_url,
+                ingress_endpoint_url=self._ingress_endpoint_url,
+                expire_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                livekit_egress=livekit_egress,
+                sample_rate=resolved_sample_rate,
+            )
 
-        # Hook into agent session's audio output
-        agent_session.output.audio = self._audio_buffer
+            # Initialize and start the avatar session
+            await self._avatarkit_session.init()
+            await self._avatarkit_session.start()
+            logger.info("SpatialReal avatar session connected")
 
-        # Start the audio buffer
-        await self._audio_buffer.start()
+            # Create audio buffer using livekit-agents' QueueAudioOutput
+            self._audio_buffer = QueueAudioOutput(sample_rate=resolved_sample_rate)
 
-        # Register for clear_buffer events (interruptions)
-        @self._audio_buffer.on("clear_buffer")
-        def on_clear_buffer() -> None:
-            asyncio.create_task(self._handle_interrupt())
+            # Hook into agent session's audio output
+            agent_session.output.audio = self._audio_buffer
+            self._audio_output_attached = True
 
-        # Register for user_state_changed events (interrupt on user speaking)
-        @agent_session.on("user_state_changed")
-        def on_user_state_changed(ev: UserStateChangedEvent) -> None:
-            if ev.new_state == "speaking":
+            # Start the audio buffer
+            await self._audio_buffer.start()
+
+            # Register for clear_buffer events (interruptions)
+            @self._audio_buffer.on("clear_buffer")
+            def on_clear_buffer() -> None:
                 asyncio.create_task(self._handle_interrupt())
 
-        # Start the main task that forwards audio to avatar
-        self._main_task = asyncio.create_task(self._run_main_task())
+            # Register for user_state_changed events (interrupt on user speaking)
+            @agent_session.on("user_state_changed")
+            def on_user_state_changed(ev: UserStateChangedEvent) -> None:
+                if ev.new_state == "speaking":
+                    asyncio.create_task(self._handle_interrupt())
 
-        self._initialized = True
-        logger.info("Avatar audio output attached to agent session")
+            # Start the main task that forwards audio to avatar
+            self._main_task = asyncio.create_task(self._run_main_task())
 
-        # Register cleanup on session close
-        @agent_session.on("close")
-        def on_session_close() -> None:
-            asyncio.create_task(self.aclose())
+            self._initialized = True
+            logger.info("Avatar audio output attached to agent session")
+
+            # Register cleanup on session close
+            @agent_session.on("close")
+            def on_session_close() -> None:
+                asyncio.create_task(self.aclose())
+
+        except asyncio.CancelledError:
+            await self.aclose()
+            raise
+        except Exception as e:
+            logger.debug("SpatialReal avatar session startup failed", exc_info=True)
+            await self.aclose()
+            raise SpatialRealException(
+                self._build_start_error_message(
+                    error=e,
+                    room_name=room_name,
+                    sample_rate=resolved_sample_rate,
+                )
+            ) from None
+
+    def _build_start_error_message(
+        self,
+        *,
+        error: Exception,
+        room_name: str,
+        sample_rate: int,
+    ) -> str:
+        reason = self._format_error_reason(error)
+        return (
+            "Failed to start SpatialReal avatar session. "
+            "Check SpatialReal credentials, endpoint URLs, and outbound network access. "
+            f"room={room_name}, avatar_id={self._avatar_id}, ingress_endpoint_url={self._ingress_endpoint_url}, "
+            f"sample_rate={sample_rate}. Reason: {reason}"
+        )
+
+    @staticmethod
+    def _format_error_reason(error: BaseException) -> str:
+        root_error = error
+        seen_errors: set[int] = set()
+
+        while id(root_error) not in seen_errors:
+            seen_errors.add(id(root_error))
+            next_error = root_error.__cause__ or (None if root_error.__suppress_context__ else root_error.__context__)
+            if next_error is None:
+                break
+            root_error = next_error
+
+        message = str(root_error) or str(error)
+        if message:
+            return f"{type(root_error).__name__}: {message}"
+
+        return type(root_error).__name__
 
     async def _run_main_task(self) -> None:
         """Main task that forwards audio from the buffer to the avatar service."""
@@ -282,6 +343,16 @@ class AvatarSession:
                 pass
             self._main_task = None
 
+        if (
+            self._agent_session
+            and self._audio_buffer
+            and self._audio_output_attached
+            and self._agent_session.output.audio is self._audio_buffer
+        ):
+            self._agent_session.output.audio = self._original_audio_output
+            self._audio_output_attached = False
+            self._original_audio_output = None
+
         if self._audio_buffer:
             await self._audio_buffer.aclose()
             self._audio_buffer = None
@@ -294,4 +365,8 @@ class AvatarSession:
                 logger.warning(f"Error closing avatar session: {e}")
             finally:
                 self._avatarkit_session = None
-                self._initialized = False
+
+        self._initialized = False
+        self._agent_session = None
+        self._audio_output_attached = False
+        self._original_audio_output = None
