@@ -268,11 +268,11 @@ class AvatarSession:
         root_error = error
         seen_errors: set[int] = set()
 
-        while True:
-            next_error = root_error.__cause__ or (None if root_error.__suppress_context__ else root_error.__context__)
-            if next_error is None or id(next_error) in seen_errors:
-                break
+        while id(root_error) not in seen_errors:
             seen_errors.add(id(root_error))
+            next_error = root_error.__cause__ or (None if root_error.__suppress_context__ else root_error.__context__)
+            if next_error is None:
+                break
             root_error = next_error
 
         message = str(root_error) or str(error)
