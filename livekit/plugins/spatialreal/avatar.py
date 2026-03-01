@@ -58,6 +58,8 @@ class AvatarSession:
         avatar_participant_identity: LiveKit identity for the avatar participant.
         idle_timeout_seconds: Idle timeout in seconds for the egress connection.
             A value of 0 uses server defaults.
+        sample_rate: Optional audio sample rate override for avatar audio.
+            Falls back to agent_session.tts.sample_rate or a default value.
 
     Usage:
         avatar = AvatarSession()
@@ -74,6 +76,7 @@ class AvatarSession:
         ingress_endpoint_url: str | None = None,
         avatar_participant_identity: str | None = None,
         idle_timeout_seconds: int = 0,
+        sample_rate: int | None = None,
     ) -> None:
         # Resolve API key
         self._api_key = api_key or os.getenv("SPATIALREAL_API_KEY")
@@ -109,6 +112,10 @@ class AvatarSession:
             raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
         self._idle_timeout_seconds = idle_timeout_seconds
 
+        if sample_rate is not None and sample_rate <= 0:
+            raise SpatialRealException("sample_rate must be greater than 0")
+        self._sample_rate = sample_rate
+
         # Internal state
         self._avatarkit_session: AvatarkitSession | None = None
         self._agent_session: AgentSession | None = None
@@ -126,7 +133,6 @@ class AvatarSession:
         livekit_url: str | None = None,
         livekit_api_key: str | None = None,
         livekit_api_secret: str | None = None,
-        sample_rate: int | None = None,
     ) -> None:
         """
         Start the avatar session and hook into the agent session.
@@ -137,8 +143,6 @@ class AvatarSession:
             livekit_url: LiveKit server URL. Falls back to LIVEKIT_URL env var.
             livekit_api_key: LiveKit API key. Falls back to LIVEKIT_API_KEY env var.
             livekit_api_secret: LiveKit API secret. Falls back to LIVEKIT_API_SECRET env var.
-            sample_rate: Optional audio sample rate override for avatar audio.
-                Falls back to agent_session.tts.sample_rate or a default value.
         """
         if self._initialized:
             logger.warning("Avatar session already initialized")
@@ -175,7 +179,7 @@ class AvatarSession:
         }
         livekit_egress = LiveKitEgressConfig(**livekit_egress_kwargs)
 
-        resolved_sample_rate = sample_rate
+        resolved_sample_rate = self._sample_rate
         if resolved_sample_rate is None:
             resolved_sample_rate = agent_session.tts.sample_rate if agent_session.tts else DEFAULT_SAMPLE_RATE
         if resolved_sample_rate <= 0:
