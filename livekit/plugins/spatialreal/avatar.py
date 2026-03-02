@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -19,6 +22,7 @@ from avatarkit import (
     LiveKitEgressConfig,
     new_avatar_session,
 )
+from avatarkit.proto.generated import message_pb2 as _message_pb2
 from livekit.agents import AgentSession, UserStateChangedEvent
 from livekit.agents.voice.avatar import AudioSegmentEnd, QueueAudioOutput
 
@@ -26,10 +30,14 @@ from livekit import rtc
 
 from .log import logger
 
+message_pb2: Any = _message_pb2
+
 __all__ = ["AvatarSession", "SpatialRealException"]
 
 DEFAULT_AVATAR_PARTICIPANT_IDENTITY = "spatialreal-avatar"
 DEFAULT_SAMPLE_RATE = 24000
+MIN_COMPLETION_TIMEOUT_SECONDS = 3.0
+COMPLETION_TIMEOUT_BUFFER_SECONDS = 2.0
 
 DEFAULT_CONSOLE_ENDPOINT = "https://console.us-west.spatialwalk.cloud/v1/console"
 DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress"
@@ -39,6 +47,14 @@ class SpatialRealException(Exception):
     """Exception raised for SpatialReal-related errors."""
 
     pass
+
+
+@dataclass
+class _SegmentState:
+    req_id: str
+    pushed_duration: float = 0.0
+    first_frame_at: float | None = None
+    completion_timeout_task: asyncio.Task[None] | None = None
 
 
 class AvatarSession:
@@ -124,6 +140,9 @@ class AvatarSession:
         self._audio_output_attached = False
         self._main_task: asyncio.Task | None = None
         self._initialized = False
+        self._segments: dict[str, _SegmentState] = {}
+        self._pending_segment_ids: deque[str] = deque()
+        self._active_req_id: str | None = None
 
     async def start(
         self,
@@ -199,6 +218,7 @@ class AvatarSession:
                 expire_at=datetime.now(timezone.utc) + timedelta(hours=1),
                 livekit_egress=livekit_egress,
                 sample_rate=resolved_sample_rate,
+                transport_frames=self._on_transport_frame,
             )
 
             # Initialize and start the avatar session
@@ -217,9 +237,7 @@ class AvatarSession:
             await self._audio_buffer.start()
 
             # Register for clear_buffer events (interruptions)
-            @self._audio_buffer.on("clear_buffer")
-            def on_clear_buffer() -> None:
-                asyncio.create_task(self._handle_interrupt())
+            self._audio_buffer.on("clear_buffer", self._on_clear_buffer)  # type: ignore[arg-type]
 
             # Register for user_state_changed events (interrupt on user speaking)
             @agent_session.on("user_state_changed")
@@ -291,40 +309,179 @@ class AvatarSession:
             return
 
         try:
-            frame_count = 0
             async for item in self._audio_buffer:
                 if isinstance(item, rtc.AudioFrame):
                     # Convert AudioFrame to bytes and send to avatar
                     audio_bytes = bytes(item.data)
-                    frame_count += 1
 
-                    if frame_count == 1:
-                        logger.debug("Avatar: First audio frame received")
-
-                    await self._avatarkit_session.send_audio(
+                    req_id = await self._avatarkit_session.send_audio(
                         audio=audio_bytes,
                         end=False,
                     )
+                    segment = self._segments.get(req_id)
+                    if segment is None:
+                        segment = _SegmentState(req_id=req_id)
+                        self._segments[req_id] = segment
+
+                    if segment.first_frame_at is None:
+                        segment.first_frame_at = time.time()
+                        logger.debug(f"Avatar: First audio frame received (request_id={req_id})")
+
+                    segment.pushed_duration += item.duration
+                    self._active_req_id = req_id
 
                 elif isinstance(item, AudioSegmentEnd):
                     # End of audio segment - signal completion to avatar
-                    logger.debug(f"Avatar: Segment end, sent {frame_count} frames")
-                    await self._avatarkit_session.send_audio(
+                    if self._active_req_id is None:
+                        logger.debug("Avatar: Segment end received without an active request")
+                        continue
+
+                    req_id = await self._avatarkit_session.send_audio(
                         audio=b"",
                         end=True,
                     )
 
-                    # Notify the buffer that playback is finished
-                    self._audio_buffer.notify_playback_finished(
-                        playback_position=0.0,
-                        interrupted=False,
+                    if req_id != self._active_req_id:
+                        logger.warning(
+                            "Avatar: Request ID changed while finalizing segment "
+                            f"(expected={self._active_req_id}, actual={req_id})"
+                        )
+
+                    self._active_req_id = None
+
+                    segment = self._segments.get(req_id)
+                    if segment is None:
+                        segment = _SegmentState(req_id=req_id)
+                        self._segments[req_id] = segment
+
+                    logger.debug(
+                        "Avatar: Segment input completed "
+                        f"(request_id={req_id}, duration={segment.pushed_duration:.3f}s)"
                     )
-                    frame_count = 0
+                    self._mark_segment_waiting_for_completion(segment)
 
         except asyncio.CancelledError:
             logger.debug("Avatar main task cancelled")
         except Exception as e:
             logger.error(f"Error in avatar main task: {e}")
+
+    def _mark_segment_waiting_for_completion(self, segment: _SegmentState) -> None:
+        if segment.req_id not in self._pending_segment_ids:
+            self._pending_segment_ids.append(segment.req_id)
+
+        if segment.completion_timeout_task and not segment.completion_timeout_task.done():
+            segment.completion_timeout_task.cancel()
+
+        timeout = self._compute_completion_timeout(segment)
+        segment.completion_timeout_task = asyncio.create_task(
+            self._wait_for_segment_completion_timeout(segment.req_id, timeout),
+            name=f"spatialreal_segment_timeout_{segment.req_id}",
+        )
+
+    @staticmethod
+    def _compute_completion_timeout(segment: _SegmentState) -> float:
+        if segment.first_frame_at is None:
+            return MIN_COMPLETION_TIMEOUT_SECONDS
+
+        expected_playback_end = segment.first_frame_at + segment.pushed_duration
+        remaining_playback = max(0.0, expected_playback_end - time.time())
+        return max(
+            MIN_COMPLETION_TIMEOUT_SECONDS,
+            remaining_playback + COMPLETION_TIMEOUT_BUFFER_SECONDS,
+        )
+
+    async def _wait_for_segment_completion_timeout(self, req_id: str, timeout: float) -> None:
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+
+        if self._complete_segment(req_id=req_id, interrupted=False, reason="timeout"):
+            logger.warning(
+                "Avatar segment completion timed out, assuming playback finished "
+                f"(request_id={req_id}, timeout={timeout:.2f}s)"
+            )
+
+    def _on_transport_frame(self, frame: bytes, is_last: bool) -> None:
+        if not is_last:
+            return
+
+        req_id = self._extract_req_id_from_transport_frame(frame)
+        if req_id is not None:
+            if not self._complete_segment(req_id=req_id, interrupted=False, reason="provider_end"):
+                logger.debug(f"Avatar: completion event for unknown request_id={req_id}")
+            return
+
+        if self._pending_segment_ids:
+            fallback_req_id = self._pending_segment_ids[0]
+            if self._complete_segment(req_id=fallback_req_id, interrupted=False, reason="provider_end_fallback"):
+                logger.warning(
+                    "Avatar: completion event missing request ID, matched oldest pending segment "
+                    f"(request_id={fallback_req_id})"
+                )
+
+    def _on_clear_buffer(self) -> None:
+        asyncio.create_task(self._handle_interrupt())
+
+    @staticmethod
+    def _extract_req_id_from_transport_frame(frame: bytes) -> str | None:
+        try:
+            envelope = message_pb2.Message()
+            envelope.ParseFromString(frame)
+        except Exception:
+            return None
+
+        if envelope.type != message_pb2.MESSAGE_SERVER_RESPONSE_ANIMATION:
+            return None
+
+        req_id = envelope.server_response_animation.req_id
+        return req_id or None
+
+    def _complete_segment(self, *, req_id: str, interrupted: bool, reason: str) -> bool:
+        segment = self._segments.pop(req_id, None)
+        if segment is None:
+            return False
+
+        self._pending_segment_ids = deque(
+            pending_req_id for pending_req_id in self._pending_segment_ids if pending_req_id != req_id
+        )
+
+        if segment.completion_timeout_task and not segment.completion_timeout_task.done():
+            segment.completion_timeout_task.cancel()
+
+        if self._active_req_id == req_id:
+            self._active_req_id = None
+
+        playback_position = (
+            self._estimate_interrupted_playback_position(segment) if interrupted else segment.pushed_duration
+        )
+
+        if self._audio_buffer:
+            self._audio_buffer.notify_playback_finished(
+                playback_position=playback_position,
+                interrupted=interrupted,
+            )
+
+        logger.debug(
+            "Avatar: Segment playback completed "
+            f"(request_id={req_id}, reason={reason}, interrupted={interrupted}, "
+            f"playback_position={playback_position:.3f}s, pushed_duration={segment.pushed_duration:.3f}s)"
+        )
+        return True
+
+    @staticmethod
+    def _estimate_interrupted_playback_position(segment: _SegmentState) -> float:
+        if segment.first_frame_at is None:
+            return 0.0
+
+        elapsed = max(0.0, time.time() - segment.first_frame_at)
+        return min(segment.pushed_duration, elapsed)
+
+    def _complete_all_segments(self, *, interrupted: bool, reason: str) -> None:
+        for req_id in list(self._segments.keys()):
+            self._complete_segment(req_id=req_id, interrupted=interrupted, reason=reason)
+
+        self._pending_segment_ids.clear()
 
     async def _handle_interrupt(self) -> None:
         """Handle interruption - stop avatar's current audio processing."""
@@ -333,6 +490,12 @@ class AvatarSession:
 
         try:
             interrupted_id = await self._avatarkit_session.interrupt()
+
+            if not self._complete_segment(req_id=interrupted_id, interrupted=True, reason="interrupt"):
+                # Fallback: a race can leave the request id unmatched.
+                if self._active_req_id is not None:
+                    self._complete_segment(req_id=self._active_req_id, interrupted=True, reason="interrupt_fallback")
+
             logger.debug(f"Avatar interrupted, request_id={interrupted_id}")
         except Exception as e:
             logger.warning(f"Failed to interrupt avatar: {e}")
@@ -346,6 +509,8 @@ class AvatarSession:
             except asyncio.CancelledError:
                 pass
             self._main_task = None
+
+        self._complete_all_segments(interrupted=True, reason="session_close")
 
         if (
             self._agent_session
