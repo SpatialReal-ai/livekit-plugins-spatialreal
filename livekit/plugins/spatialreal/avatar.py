@@ -38,6 +38,7 @@ DEFAULT_AVATAR_PARTICIPANT_IDENTITY = "spatialreal-avatar"
 DEFAULT_SAMPLE_RATE = 24000
 MIN_COMPLETION_TIMEOUT_SECONDS = 3.0
 COMPLETION_TIMEOUT_BUFFER_SECONDS = 2.0
+ACTIVE_SEGMENT_IDLE_END_SECONDS = 1.0
 
 DEFAULT_CONSOLE_ENDPOINT = "https://console.us-west.spatialwalk.cloud/v1/console"
 DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress"
@@ -143,6 +144,8 @@ class AvatarSession:
         self._segments: dict[str, _SegmentState] = {}
         self._pending_segment_ids: deque[str] = deque()
         self._active_req_id: str | None = None
+        self._active_segment_idle_end_task: asyncio.Task[None] | None = None
+        self._segment_finalize_lock = asyncio.Lock()
 
     async def start(
         self,
@@ -314,10 +317,22 @@ class AvatarSession:
                     # Convert AudioFrame to bytes and send to avatar
                     audio_bytes = bytes(item.data)
 
+                    previous_req_id = self._active_req_id
+
                     req_id = await self._avatarkit_session.send_audio(
                         audio=audio_bytes,
                         end=False,
                     )
+
+                    if previous_req_id and previous_req_id != req_id:
+                        logger.warning(
+                            "Avatar: request ID changed while streaming audio "
+                            f"(previous={previous_req_id}, current={req_id})"
+                        )
+                        previous_segment = self._segments.get(previous_req_id)
+                        if previous_segment is not None:
+                            self._mark_segment_waiting_for_completion(previous_segment)
+
                     segment = self._segments.get(req_id)
                     if segment is None:
                         segment = _SegmentState(req_id=req_id)
@@ -329,41 +344,100 @@ class AvatarSession:
 
                     segment.pushed_duration += item.duration
                     self._active_req_id = req_id
+                    self._schedule_active_segment_idle_end()
 
                 elif isinstance(item, AudioSegmentEnd):
                     # End of audio segment - signal completion to avatar
-                    if self._active_req_id is None:
+                    if not await self._finalize_active_segment(source="segment_end"):
                         logger.debug("Avatar: Segment end received without an active request")
-                        continue
-
-                    req_id = await self._avatarkit_session.send_audio(
-                        audio=b"",
-                        end=True,
-                    )
-
-                    if req_id != self._active_req_id:
-                        logger.warning(
-                            "Avatar: Request ID changed while finalizing segment "
-                            f"(expected={self._active_req_id}, actual={req_id})"
-                        )
-
-                    self._active_req_id = None
-
-                    segment = self._segments.get(req_id)
-                    if segment is None:
-                        segment = _SegmentState(req_id=req_id)
-                        self._segments[req_id] = segment
-
-                    logger.debug(
-                        "Avatar: Segment input completed "
-                        f"(request_id={req_id}, duration={segment.pushed_duration:.3f}s)"
-                    )
-                    self._mark_segment_waiting_for_completion(segment)
 
         except asyncio.CancelledError:
             logger.debug("Avatar main task cancelled")
         except Exception as e:
             logger.error(f"Error in avatar main task: {e}")
+
+    def _cancel_active_segment_idle_end(self) -> None:
+        if self._active_segment_idle_end_task and not self._active_segment_idle_end_task.done():
+            self._active_segment_idle_end_task.cancel()
+        self._active_segment_idle_end_task = None
+
+    def _schedule_active_segment_idle_end(self) -> None:
+        active_req_id = self._active_req_id
+        if active_req_id is None:
+            return
+
+        self._cancel_active_segment_idle_end()
+        self._active_segment_idle_end_task = asyncio.create_task(
+            self._wait_for_active_segment_idle_end(active_req_id, ACTIVE_SEGMENT_IDLE_END_SECONDS),
+            name=f"spatialreal_idle_segment_end_{active_req_id}",
+        )
+
+    async def _wait_for_active_segment_idle_end(self, req_id: str, timeout: float) -> None:
+        try:
+            await asyncio.sleep(timeout)
+        except asyncio.CancelledError:
+            return
+
+        if self._active_req_id != req_id:
+            return
+
+        if req_id in self._pending_segment_ids:
+            return
+
+        if req_id not in self._segments:
+            return
+
+        if await self._finalize_active_segment(source="idle_timeout"):
+            logger.warning(
+                "Avatar: Segment end marker missing, forcing segment finalization "
+                f"(request_id={req_id}, idle_timeout={timeout:.2f}s)"
+            )
+
+    async def _finalize_active_segment(self, *, source: str) -> bool:
+        if self._active_req_id is None or not self._avatarkit_session:
+            return False
+
+        async with self._segment_finalize_lock:
+            active_req_id = self._active_req_id
+            if active_req_id is None:
+                return False
+
+            self._cancel_active_segment_idle_end()
+
+            req_id = await self._avatarkit_session.send_audio(
+                audio=b"",
+                end=True,
+            )
+
+            if req_id != active_req_id:
+                logger.warning(
+                    "Avatar: Request ID changed while finalizing segment "
+                    f"(expected={active_req_id}, actual={req_id}, source={source})"
+                )
+
+            self._active_req_id = None
+
+            active_segment = self._segments.pop(active_req_id, None)
+            segment = self._segments.get(req_id)
+
+            if segment is None:
+                if active_segment is not None:
+                    active_segment.req_id = req_id
+                    segment = active_segment
+                else:
+                    segment = _SegmentState(req_id=req_id)
+                self._segments[req_id] = segment
+            elif active_segment is not None and segment is not active_segment:
+                segment.pushed_duration = max(segment.pushed_duration, active_segment.pushed_duration)
+                if segment.first_frame_at is None:
+                    segment.first_frame_at = active_segment.first_frame_at
+
+            logger.debug(
+                "Avatar: Segment input completed "
+                f"(request_id={req_id}, duration={segment.pushed_duration:.3f}s, source={source})"
+            )
+            self._mark_segment_waiting_for_completion(segment)
+            return True
 
     def _mark_segment_waiting_for_completion(self, segment: _SegmentState) -> None:
         if segment.req_id not in self._pending_segment_ids:
@@ -408,6 +482,12 @@ class AvatarSession:
 
         req_id = self._extract_req_id_from_transport_frame(frame)
         if req_id is not None:
+            if req_id not in self._pending_segment_ids:
+                logger.debug(
+                    f"Avatar: ignoring provider completion before local segment finalization (request_id={req_id})"
+                )
+                return
+
             if not self._complete_segment(req_id=req_id, interrupted=False, reason="provider_end"):
                 logger.debug(f"Avatar: completion event for unknown request_id={req_id}")
             return
@@ -451,6 +531,7 @@ class AvatarSession:
 
         if self._active_req_id == req_id:
             self._active_req_id = None
+            self._cancel_active_segment_idle_end()
 
         playback_position = (
             self._estimate_interrupted_playback_position(segment) if interrupted else segment.pushed_duration
@@ -481,6 +562,8 @@ class AvatarSession:
         for req_id in list(self._segments.keys()):
             self._complete_segment(req_id=req_id, interrupted=interrupted, reason=reason)
 
+        self._active_req_id = None
+        self._cancel_active_segment_idle_end()
         self._pending_segment_ids.clear()
 
     async def _handle_interrupt(self) -> None:
@@ -509,6 +592,8 @@ class AvatarSession:
             except asyncio.CancelledError:
                 pass
             self._main_task = None
+
+        self._cancel_active_segment_idle_end()
 
         self._complete_all_segments(interrupted=True, reason="session_close")
 
