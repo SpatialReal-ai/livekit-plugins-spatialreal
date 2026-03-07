@@ -420,12 +420,18 @@ class AvatarSession:
             active_segment = self._segments.pop(active_req_id, None)
             segment = self._segments.get(req_id)
 
+            if active_segment is None and segment is None:
+                logger.debug(
+                    "Avatar: Segment completed before finalization finished "
+                    f"(request_id={active_req_id}, finalize_request_id={req_id}, source={source})"
+                )
+                return True
+
             if segment is None:
-                if active_segment is not None:
-                    active_segment.req_id = req_id
-                    segment = active_segment
-                else:
-                    segment = _SegmentState(req_id=req_id)
+                if active_segment is None:
+                    return True
+                active_segment.req_id = req_id
+                segment = active_segment
                 self._segments[req_id] = segment
             elif active_segment is not None and segment is not active_segment:
                 segment.pushed_duration = max(segment.pushed_duration, active_segment.pushed_duration)
@@ -574,10 +580,18 @@ class AvatarSession:
         try:
             interrupted_id = await self._avatarkit_session.interrupt()
 
-            if not self._complete_segment(req_id=interrupted_id, interrupted=True, reason="interrupt"):
-                # Fallback: a race can leave the request id unmatched.
-                if self._active_req_id is not None:
-                    self._complete_segment(req_id=self._active_req_id, interrupted=True, reason="interrupt_fallback")
+            async with self._segment_finalize_lock:
+                if not self._complete_segment(req_id=interrupted_id, interrupted=True, reason="interrupt"):
+                    # Fallback: a race can leave the request id unmatched.
+                    if self._active_req_id is not None:
+                        self._complete_segment(
+                            req_id=self._active_req_id,
+                            interrupted=True,
+                            reason="interrupt_fallback",
+                        )
+                # Complete any remaining pending segments that were also interrupted
+                for req_id in list(self._segments.keys()):
+                    self._complete_segment(req_id=req_id, interrupted=True, reason="interrupt_remaining")
 
             logger.debug(f"Avatar interrupted, request_id={interrupted_id}")
         except Exception as e:
