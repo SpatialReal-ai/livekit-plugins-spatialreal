@@ -3,7 +3,7 @@
 This plugin provides integration with SpatialReal's avatar service for
 lip-synced avatar rendering in LiveKit voice agents.
 
-See https://docs.spatialreal.com for more information.
+See https://docs.spatialreal.ai for more information.
 
 Usage:
     from livekit.plugins.spatialreal import AvatarSession
