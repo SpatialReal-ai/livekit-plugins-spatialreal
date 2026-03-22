@@ -23,8 +23,9 @@ from avatarkit import (
     new_avatar_session,
 )
 from avatarkit.proto.generated import message_pb2 as _message_pb2
-from livekit.agents import AgentSession, UserStateChangedEvent
+from livekit.agents import AgentSession, UserStateChangedEvent, get_job_context
 from livekit.agents.voice.avatar import AudioSegmentEnd, QueueAudioOutput
+from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import rtc
 
@@ -39,6 +40,8 @@ DEFAULT_SAMPLE_RATE = 24000
 MIN_COMPLETION_TIMEOUT_SECONDS = 3.0
 COMPLETION_TIMEOUT_BUFFER_SECONDS = 2.0
 ACTIVE_SEGMENT_IDLE_END_SECONDS = 1.0
+DEFAULT_SESSION_TTL = timedelta(hours=1)
+LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
 
 DEFAULT_CONSOLE_ENDPOINT = "https://console.us-west.spatialwalk.cloud/v1/console"
 DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress"
@@ -175,25 +178,36 @@ class AvatarSession:
         lk_api_key = livekit_api_key or os.getenv("LIVEKIT_API_KEY")
         lk_api_secret = livekit_api_secret or os.getenv("LIVEKIT_API_SECRET")
 
-        if not lk_url or not lk_api_key or not lk_api_secret:
+        if not lk_url:
+            raise SpatialRealException("livekit_url must be provided or LIVEKIT_URL environment variable must be set")
+
+        if not lk_api_key or not lk_api_secret:
             raise SpatialRealException(
-                "livekit_url, livekit_api_key, and livekit_api_secret must be provided "
-                "or LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET environment variables must be set"
+                "livekit_api_key and livekit_api_secret must be provided "
+                "or LIVEKIT_API_KEY and LIVEKIT_API_SECRET environment variables must be set"
             )
 
         room_name = room.name
-        agent_participant_identity = room.local_participant.identity
+        agent_participant_identity = self._resolve_local_participant_identity(room)
         logger.info(f"Initializing SpatialReal avatar session for room: {room_name}")
         logger.debug(f"Console endpoint: {self._console_endpoint_url}")
         logger.debug(f"Ingress endpoint: {self._ingress_endpoint_url}")
 
-        egress_attributes = {"lk.publish_on_behalf": agent_participant_identity}
+        egress_attributes = {ATTRIBUTE_PUBLISH_ON_BEHALF: agent_participant_identity}
+        session_expire_at = datetime.now(timezone.utc) + DEFAULT_SESSION_TTL
+        resolved_lk_api_token = self._generate_livekit_api_token(
+            room_name=room_name,
+            livekit_api_key=lk_api_key,
+            livekit_api_secret=lk_api_secret,
+            publisher_identity=self._avatar_participant_identity,
+            publisher_attributes=egress_attributes,
+            ttl=DEFAULT_SESSION_TTL,
+        )
 
         # Create LiveKit egress configuration for the avatar to join the room
         livekit_egress_kwargs: dict[str, Any] = {
             "url": lk_url,
-            "api_key": lk_api_key,
-            "api_secret": lk_api_secret,
+            "api_token": resolved_lk_api_token,
             "room_name": room_name,
             "publisher_id": self._avatar_participant_identity,
             "extra_attributes": egress_attributes,
@@ -218,7 +232,7 @@ class AvatarSession:
                 avatar_id=self._avatar_id,
                 console_endpoint_url=self._console_endpoint_url,
                 ingress_endpoint_url=self._ingress_endpoint_url,
-                expire_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                expire_at=session_expire_at,
                 livekit_egress=livekit_egress,
                 sample_rate=resolved_sample_rate,
                 transport_frames=self._on_transport_frame,
@@ -283,10 +297,63 @@ class AvatarSession:
         reason = self._format_error_reason(error)
         return (
             "Failed to start SpatialReal avatar session. "
-            "Check SpatialReal credentials, endpoint URLs, and outbound network access. "
+            "Check SpatialReal credentials, LiveKit room auth/token configuration, "
+            "endpoint URLs, and outbound network access. "
             f"room={room_name}, avatar_id={self._avatar_id}, ingress_endpoint_url={self._ingress_endpoint_url}, "
             f"sample_rate={sample_rate}. Reason: {reason}"
         )
+
+    @staticmethod
+    def _generate_livekit_api_token(
+        *,
+        room_name: str,
+        livekit_api_key: str,
+        livekit_api_secret: str,
+        publisher_identity: str,
+        publisher_attributes: dict[str, str],
+        ttl: timedelta,
+    ) -> str:
+        try:
+            from livekit import api as livekit_api
+        except ImportError as exc:
+            raise SpatialRealException(
+                "livekit-api must be installed to generate LiveKit access tokens for avatar egress"
+            ) from exc
+
+        try:
+            return (
+                livekit_api.AccessToken(livekit_api_key, livekit_api_secret)
+                .with_kind("agent")
+                .with_identity(publisher_identity)
+                .with_name(publisher_identity)
+                .with_ttl(ttl)
+                .with_attributes(publisher_attributes)
+                .with_grants(
+                    livekit_api.VideoGrants(
+                        room_join=True,
+                        room=room_name,
+                        can_subscribe=False,
+                        can_publish_data=False,
+                        can_publish_sources=LIVEKIT_AVATAR_PUBLISH_SOURCES,
+                    )
+                )
+                .to_jwt()
+            )
+        except Exception as exc:
+            raise SpatialRealException(
+                "Failed to generate LiveKit access token for avatar worker. "
+                f"room={room_name}, publisher_identity={publisher_identity}. "
+                f"Reason: {AvatarSession._format_error_reason(exc)}"
+            ) from exc
+
+    @staticmethod
+    def _resolve_local_participant_identity(room: rtc.Room) -> str:
+        try:
+            return get_job_context().token_claims().identity
+        except RuntimeError as exc:
+            if not room.isconnected():
+                raise SpatialRealException("failed to get local participant identity") from exc
+            return room.local_participant.identity
 
     @staticmethod
     def _format_error_reason(error: BaseException) -> str:
