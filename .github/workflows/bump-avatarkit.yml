@@ -1,0 +1,89 @@
+name: Bump avatarkit
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-avatarkit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch latest avatarkit release
+        id: latest_release
+        run: |
+          version=$(curl -fsSL \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: livekit-plugins-spatialreal-bump-workflow' \
+            https://api.github.com/repos/spatialwalk/avatar-sdk-python/releases/latest | python -c "import json, sys; print(json.load(sys.stdin)['tag_name'].lstrip('v'))")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Bump avatarkit requirement
+        id: bump
+        env:
+          TARGET_VERSION: ${{ steps.latest_release.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          def parse_version(value: str) -> tuple[int, ...]:
+              return tuple(int(part) for part in value.split('.'))
+
+          path = Path('pyproject.toml')
+          content = path.read_text(encoding='utf-8')
+          match = re.search(r'"avatarkit>=(\d+(?:\.\d+)*)"', content)
+          if match is None:
+              raise SystemExit('Could not find avatarkit dependency in pyproject.toml')
+
+          current_version = match.group(1)
+          target_version = os.environ['TARGET_VERSION']
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              print(f'current={current_version}', file=fh)
+              print(f'target={target_version}', file=fh)
+
+          if parse_version(target_version) <= parse_version(current_version):
+              with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+                  print('changed=false', file=fh)
+              raise SystemExit(0)
+
+          updated = re.sub(
+              r'"avatarkit>=(\d+(?:\.\d+)*)"',
+              f'"avatarkit>={target_version}"',
+              content,
+              count=1,
+          )
+          path.write_text(updated, encoding='utf-8')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              print('changed=true', file=fh)
+          PY
+
+      - name: Create pull request
+        if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: 'chore: bump avatarkit to v${{ steps.latest_release.outputs.version }}'
+          branch: 'automation/bump-avatarkit-v${{ steps.latest_release.outputs.version }}'
+          delete-branch: true
+          title: 'chore: bump avatarkit to v${{ steps.latest_release.outputs.version }}'
+          body: |
+            This PR was generated automatically after a new avatar-sdk-python release was detected.
+
+            - source repo: https://github.com/spatialwalk/avatar-sdk-python
+            - updated dependency: avatarkit>=${{ steps.latest_release.outputs.version }}
+            - previous minimum: ${{ steps.bump.outputs.current }}
