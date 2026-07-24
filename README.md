@@ -97,6 +97,7 @@ Main class for integrating SpatialReal avatars with LiveKit agents.
 | `console_endpoint_url` | `str` | Custom console endpoint URL |
 | `ingress_endpoint_url` | `str` | Custom ingress endpoint URL |
 | `avatar_participant_identity` | `str` | LiveKit identity for avatar participant |
+| `avatar_participant_name` | `str` | LiveKit display name for avatar participant |
 | `idle_timeout_seconds` | `int` | LiveKit egress idle timeout in seconds (`0` uses server defaults) |
 | `sample_rate` | `int \| None` | Optional avatar audio sample rate override |
 
@@ -121,4 +122,4 @@ Exception raised for SpatialReal-related errors.
 
 ## License
 
-MIT
+Apache-2.0

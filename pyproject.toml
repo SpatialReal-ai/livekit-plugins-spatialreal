@@ -7,26 +7,22 @@ name = "livekit-plugins-spatialreal"
 dynamic = ["version"]
 description = "Agent Framework plugin for SpatialReal Avatar"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10.0"
 authors = [{ name = "3DRX", email = "3drxkjy@gmail.com" }]
 keywords = ["voice", "ai", "realtime", "audio", "video", "livekit", "webrtc", "avatar", "spatialreal"]
 classifiers = [
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Multimedia :: Video",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-    "livekit-agents>=1.2.9",
+    "livekit-agents>=1.6.6",
     "avatarkit>=0.1.7",
 ]
 
