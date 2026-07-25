@@ -1,18 +1,23 @@
-"""SpatialReal avatar plugin for LiveKit Agents.
+# Copyright 2026 SpatialReal.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-This plugin provides integration with SpatialReal's avatar service for
-lip-synced avatar rendering in LiveKit voice agents.
+"""SpatialReal avatar plugin for LiveKit Agents."""
 
-See https://docs.spatialreal.ai for more information.
-
-Usage:
-    from livekit.plugins.spatialreal import AvatarSession
-
-    avatar = AvatarSession()
-    await avatar.start(agent_session, room=ctx.room)
-"""
+from livekit.agents import Plugin
 
 from .avatar import AvatarSession, SpatialRealException
+from .log import logger
 from .version import __version__
 
 __all__ = [
@@ -21,17 +26,10 @@ __all__ = [
     "__version__",
 ]
 
-# Try to register plugin if Plugin class is available (livekit-agents >= 1.3)
-try:
-    from livekit.agents import Plugin
 
-    from .log import logger
+class SpatialRealPlugin(Plugin):
+    def __init__(self) -> None:
+        super().__init__(__name__, __version__, __package__, logger)
 
-    class SpatialRealPlugin(Plugin):
-        def __init__(self) -> None:
-            super().__init__(__name__, __version__, __package__, logger)
 
-    Plugin.register_plugin(SpatialRealPlugin())
-except (ImportError, AttributeError):
-    # Plugin registration not available in older versions
-    pass
+Plugin.register_plugin(SpatialRealPlugin())

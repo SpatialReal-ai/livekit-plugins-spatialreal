@@ -1,9 +1,16 @@
-"""
-SpatialReal Avatar integration for LiveKit Agents.
-
-This module provides AvatarSession which hooks into an AgentSession
-to route TTS audio to the SpatialReal avatar service.
-"""
+# Copyright 2026 SpatialReal.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
@@ -15,19 +22,24 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from avatarkit import (
-    AvatarSession as AvatarkitSession,
-)
-from avatarkit import (
-    LiveKitEgressConfig,
-    new_avatar_session,
-)
+from avatarkit import AvatarSession as AvatarkitSession
+from avatarkit import LiveKitEgressConfig, new_avatar_session
 from avatarkit.proto.generated import message_pb2 as _message_pb2
-from livekit.agents import AgentSession, UserStateChangedEvent, get_job_context
-from livekit.agents.voice.avatar import AudioSegmentEnd, QueueAudioOutput
+from livekit.agents import (
+    NOT_GIVEN,
+    AgentSession,
+    NotGivenOr,
+    get_job_context,
+    utils,
+)
+from livekit.agents.voice.avatar import (
+    AudioSegmentEnd,
+    QueueAudioOutput,
+)
+from livekit.agents.voice.avatar import AvatarSession as BaseAvatarSession
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
-from livekit import rtc
+from livekit import api, rtc
 
 from .log import logger
 
@@ -36,6 +48,7 @@ message_pb2: Any = _message_pb2
 __all__ = ["AvatarSession", "SpatialRealException"]
 
 DEFAULT_AVATAR_PARTICIPANT_IDENTITY = "spatialreal-avatar"
+DEFAULT_AVATAR_PARTICIPANT_NAME = "spatialreal-avatar"
 DEFAULT_SAMPLE_RATE = 24000
 MIN_COMPLETION_TIMEOUT_SECONDS = 3.0
 COMPLETION_TIMEOUT_BUFFER_SECONDS = 2.0
@@ -48,9 +61,7 @@ DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress
 
 
 class SpatialRealException(Exception):
-    """Exception raised for SpatialReal-related errors."""
-
-    pass
+    """Exception raised for SpatialReal avatar integration errors."""
 
 
 @dataclass
@@ -61,82 +72,78 @@ class _SegmentState:
     completion_timeout_task: asyncio.Task[None] | None = None
 
 
-class AvatarSession:
-    """
-    This connects to SpatialReal's avatar service and routes TTS audio
-    from the agent to the avatar for lip-synced rendering. The avatar
-    service joins the LiveKit room and publishes synchronized video + audio.
+class AvatarSession(BaseAvatarSession):
+    """A SpatialReal avatar session.
 
-    Args:
-        api_key: SpatialReal API key. Falls back to SPATIALREAL_API_KEY env var.
-        app_id: SpatialReal application ID. Falls back to SPATIALREAL_APP_ID env var.
-        avatar_id: Avatar ID to use. Falls back to SPATIALREAL_AVATAR_ID env var.
-        console_endpoint_url: Console endpoint URL. Falls back to
-            SPATIALREAL_CONSOLE_ENDPOINT env var or default.
-        ingress_endpoint_url: Ingress endpoint URL. Falls back to
-            SPATIALREAL_INGRESS_ENDPOINT env var or default.
-        avatar_participant_identity: LiveKit identity for the avatar participant.
-        idle_timeout_seconds: Idle timeout in seconds for the egress connection.
-            A value of 0 uses server defaults.
-        sample_rate: Optional audio sample rate override for avatar audio.
-            Falls back to agent_session.tts.sample_rate or a default value.
-
-    Usage:
-        avatar = AvatarSession()
-        await avatar.start(session, room=ctx.room)
+    The LiveKit agent produces speech as usual. This plugin forwards the TTS audio
+    to SpatialReal, and the SpatialReal avatar worker joins the LiveKit room to publish
+    synchronized avatar audio/video.
     """
 
     def __init__(
         self,
         *,
-        api_key: str | None = None,
-        app_id: str | None = None,
-        avatar_id: str | None = None,
-        console_endpoint_url: str | None = None,
-        ingress_endpoint_url: str | None = None,
-        avatar_participant_identity: str | None = None,
+        api_key: NotGivenOr[str] = NOT_GIVEN,
+        app_id: NotGivenOr[str] = NOT_GIVEN,
+        avatar_id: NotGivenOr[str] = NOT_GIVEN,
+        console_endpoint_url: NotGivenOr[str] = NOT_GIVEN,
+        ingress_endpoint_url: NotGivenOr[str] = NOT_GIVEN,
+        avatar_participant_identity: NotGivenOr[str] = NOT_GIVEN,
+        avatar_participant_name: NotGivenOr[str] = NOT_GIVEN,
         idle_timeout_seconds: int = 0,
-        sample_rate: int | None = None,
+        sample_rate: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
-        # Resolve API key
-        self._api_key = api_key or os.getenv("SPATIALREAL_API_KEY")
-        if not self._api_key:
+        super().__init__()
+        resolved_api_key = api_key if utils.is_given(api_key) else os.getenv("SPATIALREAL_API_KEY")
+        if not resolved_api_key:
             raise SpatialRealException(
-                "api_key must be provided or SPATIALREAL_API_KEY environment variable must be set"
+                "api_key must be set either by passing it to AvatarSession or "
+                "by setting the SPATIALREAL_API_KEY environment variable"
             )
 
-        # Resolve app ID
-        self._app_id = app_id or os.getenv("SPATIALREAL_APP_ID")
-        if not self._app_id:
-            raise SpatialRealException("app_id must be provided or SPATIALREAL_APP_ID environment variable must be set")
-
-        # Resolve avatar ID
-        self._avatar_id = avatar_id or os.getenv("SPATIALREAL_AVATAR_ID")
-        if not self._avatar_id:
+        resolved_app_id = app_id if utils.is_given(app_id) else os.getenv("SPATIALREAL_APP_ID")
+        if not resolved_app_id:
             raise SpatialRealException(
-                "avatar_id must be provided or SPATIALREAL_AVATAR_ID environment variable must be set"
+                "app_id must be set either by passing it to AvatarSession or "
+                "by setting the SPATIALREAL_APP_ID environment variable"
             )
 
-        # Resolve endpoints
-        self._console_endpoint_url = (
-            console_endpoint_url or os.getenv("SPATIALREAL_CONSOLE_ENDPOINT") or DEFAULT_CONSOLE_ENDPOINT
-        )
-        self._ingress_endpoint_url = (
-            ingress_endpoint_url or os.getenv("SPATIALREAL_INGRESS_ENDPOINT") or DEFAULT_INGRESS_ENDPOINT
-        )
-
-        # Avatar participant configuration
-        self._avatar_participant_identity = avatar_participant_identity or DEFAULT_AVATAR_PARTICIPANT_IDENTITY
+        resolved_avatar_id = avatar_id if utils.is_given(avatar_id) else os.getenv("SPATIALREAL_AVATAR_ID")
+        if not resolved_avatar_id:
+            raise SpatialRealException(
+                "avatar_id must be set either by passing it to AvatarSession or "
+                "by setting the SPATIALREAL_AVATAR_ID environment variable"
+            )
 
         if idle_timeout_seconds < 0:
             raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
-        self._idle_timeout_seconds = idle_timeout_seconds
-
-        if sample_rate is not None and sample_rate <= 0:
+        if utils.is_given(sample_rate) and sample_rate <= 0:
             raise SpatialRealException("sample_rate must be greater than 0")
-        self._sample_rate = sample_rate
 
-        # Internal state
+        self._api_key = str(resolved_api_key)
+        self._app_id = str(resolved_app_id)
+        self._avatar_id = str(resolved_avatar_id)
+        self._console_endpoint_url = str(
+            console_endpoint_url
+            if utils.is_given(console_endpoint_url)
+            else os.getenv("SPATIALREAL_CONSOLE_ENDPOINT") or DEFAULT_CONSOLE_ENDPOINT
+        )
+        self._ingress_endpoint_url = str(
+            ingress_endpoint_url
+            if utils.is_given(ingress_endpoint_url)
+            else os.getenv("SPATIALREAL_INGRESS_ENDPOINT") or DEFAULT_INGRESS_ENDPOINT
+        )
+        self._avatar_participant_identity = str(
+            avatar_participant_identity
+            if utils.is_given(avatar_participant_identity)
+            else DEFAULT_AVATAR_PARTICIPANT_IDENTITY
+        )
+        self._avatar_participant_name = str(
+            avatar_participant_name if utils.is_given(avatar_participant_name) else DEFAULT_AVATAR_PARTICIPANT_NAME
+        )
+        self._idle_timeout_seconds = idle_timeout_seconds
+        self._sample_rate = sample_rate if utils.is_given(sample_rate) else None
+
         self._avatarkit_session: AvatarkitSession | None = None
         self._agent_session: AgentSession | None = None
         self._audio_buffer: QueueAudioOutput | None = None
@@ -150,70 +157,78 @@ class AvatarSession:
         self._active_segment_idle_end_task: asyncio.Task[None] | None = None
         self._segment_finalize_lock = asyncio.Lock()
 
+    @property
+    def avatar_identity(self) -> str:
+        return self._avatar_participant_identity
+
+    @property
+    def provider(self) -> str:
+        return "spatialreal"
+
     async def start(
         self,
         agent_session: AgentSession,
         room: rtc.Room,
         *,
-        livekit_url: str | None = None,
-        livekit_api_key: str | None = None,
-        livekit_api_secret: str | None = None,
+        livekit_url: NotGivenOr[str] = NOT_GIVEN,
+        livekit_api_key: NotGivenOr[str] = NOT_GIVEN,
+        livekit_api_secret: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
-        """
-        Start the avatar session and hook into the agent session.
-
-        Args:
-            agent_session: The AgentSession to hook into for TTS audio.
-            room: The LiveKit room for egress configuration.
-            livekit_url: LiveKit server URL. Falls back to LIVEKIT_URL env var.
-            livekit_api_key: LiveKit API key. Falls back to LIVEKIT_API_KEY env var.
-            livekit_api_secret: LiveKit API secret. Falls back to LIVEKIT_API_SECRET env var.
-        """
+        """Start the SpatialReal avatar session and attach it to the agent output."""
         if self._initialized:
             logger.warning("Avatar session already initialized")
             return
 
-        # Resolve LiveKit credentials
-        lk_url = livekit_url or os.getenv("LIVEKIT_URL")
-        lk_api_key = livekit_api_key or os.getenv("LIVEKIT_API_KEY")
-        lk_api_secret = livekit_api_secret or os.getenv("LIVEKIT_API_SECRET")
+        await super().start(agent_session, room)
 
-        if not lk_url:
-            raise SpatialRealException("livekit_url must be provided or LIVEKIT_URL environment variable must be set")
-
-        if not lk_api_key or not lk_api_secret:
+        resolved_livekit_url = livekit_url if utils.is_given(livekit_url) else os.getenv("LIVEKIT_URL")
+        resolved_livekit_api_key = livekit_api_key if utils.is_given(livekit_api_key) else os.getenv("LIVEKIT_API_KEY")
+        resolved_livekit_api_secret = (
+            livekit_api_secret if utils.is_given(livekit_api_secret) else os.getenv("LIVEKIT_API_SECRET")
+        )
+        if not resolved_livekit_url or not resolved_livekit_api_key or not resolved_livekit_api_secret:
             raise SpatialRealException(
-                "livekit_api_key and livekit_api_secret must be provided "
-                "or LIVEKIT_API_KEY and LIVEKIT_API_SECRET environment variables must be set"
+                "livekit_url, livekit_api_key, and livekit_api_secret must be set by arguments or environment variables"
             )
 
         room_name = room.name
-        agent_participant_identity = self._resolve_local_participant_identity(room)
-        logger.info(f"Initializing SpatialReal avatar session for room: {room_name}")
-        logger.debug(f"Console endpoint: {self._console_endpoint_url}")
-        logger.debug(f"Ingress endpoint: {self._ingress_endpoint_url}")
-
-        egress_attributes = {ATTRIBUTE_PUBLISH_ON_BEHALF: agent_participant_identity}
-        session_expire_at = datetime.now(timezone.utc) + DEFAULT_SESSION_TTL
-        resolved_lk_api_token = self._generate_livekit_api_token(
-            room_name=room_name,
-            livekit_api_key=lk_api_key,
-            livekit_api_secret=lk_api_secret,
-            publisher_identity=self._avatar_participant_identity,
-            publisher_attributes=egress_attributes,
-            ttl=DEFAULT_SESSION_TTL,
+        local_participant_identity = self._resolve_local_participant_identity(room)
+        logger.debug(
+            "starting SpatialReal avatar session",
+            extra={"room": room_name},
         )
 
-        # Create LiveKit egress configuration for the avatar to join the room
-        livekit_egress_kwargs: dict[str, Any] = {
-            "url": lk_url,
-            "api_token": resolved_lk_api_token,
-            "room_name": room_name,
-            "publisher_id": self._avatar_participant_identity,
-            "extra_attributes": egress_attributes,
-            "idle_timeout": self._idle_timeout_seconds,
-        }
-        livekit_egress = LiveKitEgressConfig(**livekit_egress_kwargs)
+        egress_attributes = {ATTRIBUTE_PUBLISH_ON_BEHALF: local_participant_identity}
+        livekit_token = (
+            api.AccessToken(
+                api_key=str(resolved_livekit_api_key),
+                api_secret=str(resolved_livekit_api_secret),
+            )
+            .with_kind("agent")
+            .with_identity(self._avatar_participant_identity)
+            .with_name(self._avatar_participant_name)
+            .with_ttl(DEFAULT_SESSION_TTL)
+            .with_attributes(egress_attributes)
+            .with_grants(
+                api.VideoGrants(
+                    room_join=True,
+                    room=room_name,
+                    can_subscribe=False,
+                    can_publish_data=False,
+                    can_publish_sources=LIVEKIT_AVATAR_PUBLISH_SOURCES,
+                )
+            )
+            .to_jwt()
+        )
+
+        livekit_egress = LiveKitEgressConfig(
+            url=str(resolved_livekit_url),
+            api_token=livekit_token,
+            room_name=room_name,
+            publisher_id=self._avatar_participant_identity,
+            extra_attributes=egress_attributes,
+            idle_timeout=self._idle_timeout_seconds,
+        )
 
         resolved_sample_rate = self._sample_rate
         if resolved_sample_rate is None:
@@ -225,52 +240,47 @@ class AvatarSession:
         self._original_audio_output = agent_session.output.audio
 
         try:
-            # Create avatar session with LiveKit egress mode
             self._avatarkit_session = new_avatar_session(
                 api_key=self._api_key,
                 app_id=self._app_id,
                 avatar_id=self._avatar_id,
                 console_endpoint_url=self._console_endpoint_url,
                 ingress_endpoint_url=self._ingress_endpoint_url,
-                expire_at=session_expire_at,
+                expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
                 livekit_egress=livekit_egress,
                 sample_rate=resolved_sample_rate,
                 transport_frames=self._on_transport_frame,
             )
-
-            # Initialize and start the avatar session
             await self._avatarkit_session.init()
             await self._avatarkit_session.start()
-            logger.info("SpatialReal avatar session connected")
 
-            # Create audio buffer using livekit-agents' QueueAudioOutput
             self._audio_buffer = QueueAudioOutput(sample_rate=resolved_sample_rate)
-
-            # Hook into agent session's audio output
-            agent_session.output.audio = self._audio_buffer
-            self._audio_output_attached = True
-
-            # Start the audio buffer
             await self._audio_buffer.start()
-
-            # Register for clear_buffer events (interruptions)
             self._audio_buffer.on("clear_buffer", self._on_clear_buffer)  # type: ignore[arg-type]
 
-            # Register for user_state_changed events (interrupt on user speaking)
-            @agent_session.on("user_state_changed")
-            def on_user_state_changed(ev: UserStateChangedEvent) -> None:
-                if ev.new_state == "speaking":
-                    asyncio.create_task(self._handle_interrupt())
-
-            # Start the main task that forwards audio to avatar
-            self._main_task = asyncio.create_task(self._run_main_task())
-
+            agent_session.output.audio = self._audio_buffer
+            self._audio_output_attached = True
+            self._main_task = asyncio.create_task(
+                self._run_main_task(),
+                name="spatialreal_avatar_audio_forwarder",
+            )
             self._initialized = True
-            logger.info("Avatar audio output attached to agent session")
 
-            # Register cleanup on session close
+            # Interruption is owned entirely by the framework. The single
+            # authoritative interrupt signal is ``clear_buffer`` on the
+            # QueueAudioOutput (registered above): the framework emits it only
+            # after its turn detector / TurnHandlingOptions.interruption gates
+            # decide the user genuinely interrupted. We deliberately do NOT
+            # interrupt on ``user_state_changed`` -> "speaking" — that fires on
+            # raw VAD, upstream of every framework gate, so coughs, throat
+            # clears and single-word fragments would truncate the avatar even
+            # when turn handling would not treat them as a real interruption.
+            # This matches the framework's reference receiver
+            # (livekit/agents/voice/avatar/_runner.py:_on_clear_buffer); none of
+            # the official avatar plugins listen to user_state_changed.
+
             @agent_session.on("close")
-            def on_session_close() -> None:
+            def _on_session_close(_: Any) -> None:
                 asyncio.create_task(self.aclose())
 
         except asyncio.CancelledError:
@@ -294,66 +304,23 @@ class AvatarSession:
         room_name: str,
         sample_rate: int,
     ) -> str:
-        reason = self._format_error_reason(error)
         return (
             "Failed to start SpatialReal avatar session. "
             "Check SpatialReal credentials, LiveKit room auth/token configuration, "
             "endpoint URLs, and outbound network access. "
-            f"room={room_name}, avatar_id={self._avatar_id}, ingress_endpoint_url={self._ingress_endpoint_url}, "
-            f"sample_rate={sample_rate}. Reason: {reason}"
+            f"room={room_name}, avatar_id={self._avatar_id}, "
+            f"ingress_endpoint_url={self._ingress_endpoint_url}, "
+            f"sample_rate={sample_rate}. Reason: {self._format_error_reason(error)}"
         )
 
     @staticmethod
-    def _generate_livekit_api_token(
-        *,
-        room_name: str,
-        livekit_api_key: str,
-        livekit_api_secret: str,
-        publisher_identity: str,
-        publisher_attributes: dict[str, str],
-        ttl: timedelta,
-    ) -> str:
-        try:
-            from livekit import api as livekit_api
-        except ImportError as exc:
-            raise SpatialRealException(
-                "livekit-api must be installed to generate LiveKit access tokens for avatar egress"
-            ) from exc
-
-        try:
-            return (
-                livekit_api.AccessToken(livekit_api_key, livekit_api_secret)
-                .with_kind("agent")
-                .with_identity(publisher_identity)
-                .with_name(publisher_identity)
-                .with_ttl(ttl)
-                .with_attributes(publisher_attributes)
-                .with_grants(
-                    livekit_api.VideoGrants(
-                        room_join=True,
-                        room=room_name,
-                        can_subscribe=False,
-                        can_publish_data=False,
-                        can_publish_sources=LIVEKIT_AVATAR_PUBLISH_SOURCES,
-                    )
-                )
-                .to_jwt()
-            )
-        except Exception as exc:
-            raise SpatialRealException(
-                "Failed to generate LiveKit access token for avatar worker. "
-                f"room={room_name}, publisher_identity={publisher_identity}. "
-                f"Reason: {AvatarSession._format_error_reason(exc)}"
-            ) from exc
-
-    @staticmethod
     def _resolve_local_participant_identity(room: rtc.Room) -> str:
-        try:
-            return get_job_context().token_claims().identity
-        except RuntimeError as exc:
-            if not room.isconnected():
-                raise SpatialRealException("failed to get local participant identity") from exc
+        job_ctx = get_job_context(required=False)
+        if job_ctx is not None:
+            return job_ctx.local_participant_identity
+        if room.isconnected():
             return room.local_participant.identity
+        raise SpatialRealException("failed to get local participant identity")
 
     @staticmethod
     def _format_error_reason(error: BaseException) -> str:
@@ -370,58 +337,51 @@ class AvatarSession:
         message = str(root_error) or str(error)
         if message:
             return f"{type(root_error).__name__}: {message}"
-
         return type(root_error).__name__
 
     async def _run_main_task(self) -> None:
-        """Main task that forwards audio from the buffer to the avatar service."""
         if not self._audio_buffer or not self._avatarkit_session:
             return
 
         try:
             async for item in self._audio_buffer:
                 if isinstance(item, rtc.AudioFrame):
-                    # Convert AudioFrame to bytes and send to avatar
-                    audio_bytes = bytes(item.data)
-
-                    previous_req_id = self._active_req_id
-
-                    req_id = await self._avatarkit_session.send_audio(
-                        audio=audio_bytes,
-                        end=False,
-                    )
-
-                    if previous_req_id and previous_req_id != req_id:
-                        logger.warning(
-                            "Avatar: request ID changed while streaming audio "
-                            f"(previous={previous_req_id}, current={req_id})"
-                        )
-                        previous_segment = self._segments.get(previous_req_id)
-                        if previous_segment is not None:
-                            self._mark_segment_waiting_for_completion(previous_segment)
-
-                    segment = self._segments.get(req_id)
-                    if segment is None:
-                        segment = _SegmentState(req_id=req_id)
-                        self._segments[req_id] = segment
-
-                    if segment.first_frame_at is None:
-                        segment.first_frame_at = time.time()
-                        logger.debug(f"Avatar: First audio frame received (request_id={req_id})")
-
-                    segment.pushed_duration += item.duration
-                    self._active_req_id = req_id
-                    self._schedule_active_segment_idle_end()
-
+                    await self._send_audio_frame(item)
                 elif isinstance(item, AudioSegmentEnd):
-                    # End of audio segment - signal completion to avatar
                     if not await self._finalize_active_segment(source="segment_end"):
-                        logger.debug("Avatar: Segment end received without an active request")
-
+                        logger.debug("Avatar segment end received without an active request")
         except asyncio.CancelledError:
-            logger.debug("Avatar main task cancelled")
+            logger.debug("SpatialReal avatar audio forwarder cancelled")
         except Exception as e:
-            logger.error(f"Error in avatar main task: {e}")
+            logger.error("Error in SpatialReal avatar audio forwarder", exc_info=e)
+
+    async def _send_audio_frame(self, frame: rtc.AudioFrame) -> None:
+        if not self._avatarkit_session:
+            return
+
+        previous_req_id = self._active_req_id
+        req_id = await self._avatarkit_session.send_audio(audio=bytes(frame.data), end=False)
+        if previous_req_id and previous_req_id != req_id:
+            logger.warning(
+                "Avatar request ID changed while streaming audio",
+                extra={"previous": previous_req_id, "current": req_id},
+            )
+            previous_segment = self._segments.get(previous_req_id)
+            if previous_segment is not None:
+                self._mark_segment_waiting_for_completion(previous_segment)
+
+        segment = self._segments.get(req_id)
+        if segment is None:
+            segment = _SegmentState(req_id=req_id)
+            self._segments[req_id] = segment
+
+        if segment.first_frame_at is None:
+            segment.first_frame_at = time.time()
+            logger.debug("SpatialReal avatar first audio frame", extra={"request_id": req_id})
+
+        segment.pushed_duration += frame.duration
+        self._active_req_id = req_id
+        self._schedule_active_segment_idle_end()
 
     def _cancel_active_segment_idle_end(self) -> None:
         if self._active_segment_idle_end_task and not self._active_segment_idle_end_task.done():
@@ -447,17 +407,14 @@ class AvatarSession:
 
         if self._active_req_id != req_id:
             return
-
         if req_id in self._pending_segment_ids:
             return
-
         if req_id not in self._segments:
             return
-
         if await self._finalize_active_segment(source="idle_timeout"):
             logger.warning(
-                "Avatar: Segment end marker missing, forcing segment finalization "
-                f"(request_id={req_id}, idle_timeout={timeout:.2f}s)"
+                "Avatar segment end marker missing; forcing finalization",
+                extra={"request_id": req_id, "idle_timeout": timeout},
             )
 
     async def _finalize_active_segment(self, *, source: str) -> bool:
@@ -470,30 +427,19 @@ class AvatarSession:
                 return False
 
             self._cancel_active_segment_idle_end()
-
-            req_id = await self._avatarkit_session.send_audio(
-                audio=b"",
-                end=True,
-            )
-
+            req_id = await self._avatarkit_session.send_audio(audio=b"", end=True)
             if req_id != active_req_id:
                 logger.warning(
-                    "Avatar: Request ID changed while finalizing segment "
-                    f"(expected={active_req_id}, actual={req_id}, source={source})"
+                    "Avatar request ID changed while finalizing segment",
+                    extra={"expected": active_req_id, "actual": req_id, "source": source},
                 )
 
             self._active_req_id = None
-
             active_segment = self._segments.pop(active_req_id, None)
             segment = self._segments.get(req_id)
 
             if active_segment is None and segment is None:
-                logger.debug(
-                    "Avatar: Segment completed before finalization finished "
-                    f"(request_id={active_req_id}, finalize_request_id={req_id}, source={source})"
-                )
                 return True
-
             if segment is None:
                 if active_segment is None:
                     return True
@@ -505,10 +451,6 @@ class AvatarSession:
                 if segment.first_frame_at is None:
                     segment.first_frame_at = active_segment.first_frame_at
 
-            logger.debug(
-                "Avatar: Segment input completed "
-                f"(request_id={req_id}, duration={segment.pushed_duration:.3f}s, source={source})"
-            )
             self._mark_segment_waiting_for_completion(segment)
             return True
 
@@ -545,8 +487,8 @@ class AvatarSession:
 
         if self._complete_segment(req_id=req_id, interrupted=False, reason="timeout"):
             logger.warning(
-                "Avatar segment completion timed out, assuming playback finished "
-                f"(request_id={req_id}, timeout={timeout:.2f}s)"
+                "Avatar segment completion timed out, assuming playback finished",
+                extra={"request_id": req_id, "timeout": timeout},
             )
 
     def _on_transport_frame(self, frame: bytes, is_last: bool) -> None:
@@ -557,24 +499,26 @@ class AvatarSession:
         if req_id is not None:
             if req_id not in self._pending_segment_ids:
                 logger.debug(
-                    f"Avatar: ignoring provider completion before local segment finalization (request_id={req_id})"
+                    "Ignoring provider completion before local segment finalization",
+                    extra={"request_id": req_id},
                 )
                 return
 
             if not self._complete_segment(req_id=req_id, interrupted=False, reason="provider_end"):
-                logger.debug(f"Avatar: completion event for unknown request_id={req_id}")
+                logger.debug("Completion event for unknown request", extra={"request_id": req_id})
             return
 
         if self._pending_segment_ids:
             fallback_req_id = self._pending_segment_ids[0]
-            if self._complete_segment(req_id=fallback_req_id, interrupted=False, reason="provider_end_fallback"):
+            if self._complete_segment(
+                req_id=fallback_req_id,
+                interrupted=False,
+                reason="provider_end_fallback",
+            ):
                 logger.warning(
-                    "Avatar: completion event missing request ID, matched oldest pending segment "
-                    f"(request_id={fallback_req_id})"
+                    "Avatar completion event missing request ID; matched oldest pending segment",
+                    extra={"request_id": fallback_req_id},
                 )
-
-    def _on_clear_buffer(self) -> None:
-        asyncio.create_task(self._handle_interrupt())
 
     @staticmethod
     def _extract_req_id_from_transport_frame(frame: bytes) -> str | None:
@@ -617,9 +561,14 @@ class AvatarSession:
             )
 
         logger.debug(
-            "Avatar: Segment playback completed "
-            f"(request_id={req_id}, reason={reason}, interrupted={interrupted}, "
-            f"playback_position={playback_position:.3f}s, pushed_duration={segment.pushed_duration:.3f}s)"
+            "SpatialReal avatar segment playback completed",
+            extra={
+                "request_id": req_id,
+                "reason": reason,
+                "interrupted": interrupted,
+                "playback_position": playback_position,
+                "pushed_duration": segment.pushed_duration,
+            },
         )
         return True
 
@@ -639,8 +588,10 @@ class AvatarSession:
         self._cancel_active_segment_idle_end()
         self._pending_segment_ids.clear()
 
+    def _on_clear_buffer(self) -> None:
+        asyncio.create_task(self._handle_interrupt())
+
     async def _handle_interrupt(self) -> None:
-        """Handle interruption - stop avatar's current audio processing."""
         if not self._avatarkit_session:
             return
 
@@ -648,24 +599,32 @@ class AvatarSession:
             interrupted_id = await self._avatarkit_session.interrupt()
 
             async with self._segment_finalize_lock:
-                if not self._complete_segment(req_id=interrupted_id, interrupted=True, reason="interrupt"):
-                    # Fallback: a race can leave the request id unmatched.
-                    if self._active_req_id is not None:
-                        self._complete_segment(
-                            req_id=self._active_req_id,
-                            interrupted=True,
-                            reason="interrupt_fallback",
-                        )
-                # Complete any remaining pending segments that were also interrupted
-                for req_id in list(self._segments.keys()):
-                    self._complete_segment(req_id=req_id, interrupted=True, reason="interrupt_remaining")
+                if (
+                    not self._complete_segment(
+                        req_id=interrupted_id,
+                        interrupted=True,
+                        reason="interrupt",
+                    )
+                    and self._active_req_id is not None
+                ):
+                    self._complete_segment(
+                        req_id=self._active_req_id,
+                        interrupted=True,
+                        reason="interrupt_fallback",
+                    )
 
-            logger.debug(f"Avatar interrupted, request_id={interrupted_id}")
+                for req_id in list(self._segments.keys()):
+                    self._complete_segment(
+                        req_id=req_id,
+                        interrupted=True,
+                        reason="interrupt_remaining",
+                    )
+
+            logger.debug("SpatialReal avatar interrupted", extra={"request_id": interrupted_id})
         except Exception as e:
-            logger.warning(f"Failed to interrupt avatar: {e}")
+            logger.warning("Failed to interrupt SpatialReal avatar", exc_info=e)
 
     async def aclose(self) -> None:
-        """Clean up avatar session resources."""
         if self._main_task:
             self._main_task.cancel()
             try:
@@ -675,7 +634,6 @@ class AvatarSession:
             self._main_task = None
 
         self._cancel_active_segment_idle_end()
-
         self._complete_all_segments(interrupted=True, reason="session_close")
 
         if (
@@ -685,8 +643,9 @@ class AvatarSession:
             and self._agent_session.output.audio is self._audio_buffer
         ):
             self._agent_session.output.audio = self._original_audio_output
-            self._audio_output_attached = False
-            self._original_audio_output = None
+
+        self._audio_output_attached = False
+        self._original_audio_output = None
 
         if self._audio_buffer:
             await self._audio_buffer.aclose()
@@ -695,13 +654,11 @@ class AvatarSession:
         if self._avatarkit_session:
             try:
                 await self._avatarkit_session.close()
-                logger.info("Avatar session closed")
+                logger.debug("SpatialReal avatar session closed")
             except Exception as e:
-                logger.warning(f"Error closing avatar session: {e}")
+                logger.warning("Error closing SpatialReal avatar session", exc_info=e)
             finally:
                 self._avatarkit_session = None
 
         self._initialized = False
         self._agent_session = None
-        self._audio_output_attached = False
-        self._original_audio_output = None
