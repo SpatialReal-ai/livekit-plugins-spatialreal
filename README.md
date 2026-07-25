@@ -40,11 +40,11 @@ LIVEKIT_API_SECRET=
 from livekit.agents import Agent, AgentSession, JobContext, cli, WorkerOptions
 from livekit.plugins import spatialreal
 
+
 class VoiceAssistant(Agent):
     def __init__(self):
-        super().__init__(
-            instructions="You are a helpful voice assistant."
-        )
+        super().__init__(instructions="You are a helpful voice assistant.")
+
 
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
@@ -66,6 +66,7 @@ async def entrypoint(ctx: JobContext):
         agent=VoiceAssistant(),
         room=ctx.room,
     )
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
