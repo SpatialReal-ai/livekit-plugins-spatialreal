@@ -256,8 +256,25 @@ async def test_audio_tail_restore_without_wrappers() -> None:
     print("PASS whole-chain fallback restore works when no wrappers exist")
 
 
+async def test_duplicate_provider_end_ignored() -> None:
+    session, fake, buffer = make_session()
+
+    await session._send_audio_frame(make_frame())
+    assert await session._finalize_active_segment(source="segment_end")
+    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    assert buffer.events == ["started", ("finished", False)], buffer.events
+
+    # egress ALR retransmission can re-deliver end=true for the same req_id
+    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    assert buffer.events == ["started", ("finished", False)], buffer.events
+    assert not session._early_provider_started_ids and not session._early_provider_completed_ids
+    print("PASS duplicate provider end=true events are ignored")
+
+
 async def main() -> None:
     await test_early_provider_completion_is_preserved()
+    await test_duplicate_provider_end_ignored()
     await test_duplicate_interrupts_coalesced()
     await test_started_precedes_finished_without_signals()
     await test_remote_track_marks_playback_started()

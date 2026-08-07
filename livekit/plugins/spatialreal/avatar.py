@@ -61,6 +61,9 @@ ACTIVE_SEGMENT_IDLE_END_SECONDS = 1.0
 # int16 amplitude (~ -50 dBFS): decoded Opus "silence" is rarely exact zeros,
 # so playback-start detection needs a small energy floor instead of any-nonzero
 AVATAR_AUDIO_ACTIVITY_THRESHOLD = 100
+# egress-mode frame retransmission (ALR) can deliver end=true more than once
+# per req_id; remember recent completions so duplicates are dropped
+COMPLETED_REQ_ID_HISTORY = 32
 DEFAULT_SESSION_TTL = timedelta(hours=1)
 LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
 
@@ -169,6 +172,7 @@ class AvatarSession(BaseAvatarSession):
         self._pending_segment_ids: deque[str] = deque()
         self._early_provider_started_ids: set[str] = set()
         self._early_provider_completed_ids: set[str] = set()
+        self._recently_completed_req_ids: deque[str] = deque(maxlen=COMPLETED_REQ_ID_HISTORY)
         self._active_req_id: str | None = None
         self._represented_participant_identity: str | None = None
         self._avatar_is_speaking = False
@@ -624,6 +628,12 @@ class AvatarSession(BaseAvatarSession):
 
     def _on_transport_frame(self, frame: bytes, is_last: bool) -> None:
         req_id = self._extract_req_id_from_transport_frame(frame)
+        if req_id is not None and req_id in self._recently_completed_req_ids:
+            logger.debug(
+                "Ignoring duplicate provider event for completed request",
+                extra={"request_id": req_id, "is_last": is_last},
+            )
+            return
         if req_id is not None:
             segment = self._segments.get(req_id)
             if segment is None:
@@ -847,6 +857,7 @@ class AvatarSession(BaseAvatarSession):
 
         self._early_provider_started_ids.discard(req_id)
         self._early_provider_completed_ids.discard(req_id)
+        self._recently_completed_req_ids.append(req_id)
 
         self._pending_segment_ids = deque(
             pending_req_id for pending_req_id in self._pending_segment_ids if pending_req_id != req_id
