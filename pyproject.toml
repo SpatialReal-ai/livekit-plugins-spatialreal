@@ -29,7 +29,7 @@ dependencies = [
 [project.urls]
 Documentation = "https://docs.spatialreal.com"
 Website = "https://www.spatialreal.ai/"
-Source = "https://github.com/spatialwalk/livekit-plugins-spatialreal"
+Source = "https://github.com/SpatialReal-ai/livekit-plugins-spatialreal"
 
 [tool.hatch.version]
 path = "livekit/plugins/spatialreal/version.py"
