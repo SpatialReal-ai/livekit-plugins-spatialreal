@@ -16,13 +16,19 @@
 
 from livekit.agents import Plugin
 
-from .avatar import AvatarPlaybackStartedEvent, AvatarSession, SpatialRealException
+from .avatar import (
+    AvatarPlaybackStartedEvent,
+    AvatarProviderConnectionEvent,
+    AvatarSession,
+    SpatialRealException,
+)
 from .log import logger
 from .version import __version__
 
 __all__ = [
     "AvatarSession",
     "AvatarPlaybackStartedEvent",
+    "AvatarProviderConnectionEvent",
     "SpatialRealException",
     "__version__",
 ]
