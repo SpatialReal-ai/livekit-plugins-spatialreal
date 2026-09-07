@@ -11,8 +11,10 @@ pip install livekit-plugins-spatialreal
 ### Versioning
 
 Starting with 1.7.1, the plugin's major and minor version track the `livekit-agents`
-release it was validated against (e.g. plugin 1.7.x targets `livekit-agents` 1.7.x). The
+release it was validated against (e.g. plugin 1.8.x targets `livekit-agents` 1.8.x). The
 patch number is the plugin's own and may advance independently.
+
+The current release, 1.8.0, is validated against `livekit-agents` 1.8.0.
 
 Or install from source:
 
