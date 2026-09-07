@@ -21,7 +21,7 @@ from collections import deque
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from avatarkit import AvatarSession as AvatarkitSession
 from avatarkit import LiveKitEgressConfig, new_avatar_session
@@ -45,7 +45,12 @@ from .resumable_queue_io import ResumableQueueAudioOutput
 
 message_pb2: Any = _message_pb2
 
-__all__ = ["AvatarPlaybackStartedEvent", "AvatarSession", "SpatialRealException"]
+__all__ = [
+    "AvatarPlaybackStartedEvent",
+    "AvatarProviderConnectionEvent",
+    "AvatarSession",
+    "SpatialRealException",
+]
 
 DEFAULT_AVATAR_PARTICIPANT_IDENTITY = "spatialreal-avatar"
 DEFAULT_AVATAR_PARTICIPANT_NAME = "spatialreal-avatar"
@@ -65,6 +70,9 @@ COMPLETED_REQ_ID_HISTORY = 32
 DEFAULT_RESUME_BUFFER_MAX_SECONDS = 180.0
 DEFAULT_SESSION_TTL = timedelta(hours=1)
 LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
+PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
+PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
+PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
 
 DEFAULT_CONSOLE_ENDPOINT = "https://console.us-west.spatialwalk.cloud/v1/console"
 DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress"
@@ -84,6 +92,17 @@ class AvatarPlaybackStartedEvent:
 
     request_id: str
     source: str
+    observed_at: float
+
+
+@dataclass(frozen=True)
+class AvatarProviderConnectionEvent:
+    """Provider connection state emitted without including conversation content."""
+
+    state: Literal["connected", "recovering", "recovered", "failed"]
+    reason: str
+    attempt: int
+    generation: int
     observed_at: float
 
 
@@ -209,6 +228,7 @@ class AvatarSession(BaseAvatarSession):
         self._segment_finalize_lock = asyncio.Lock()
         self._interrupt_lock = asyncio.Lock()
         self._provider_io_lock = asyncio.Lock()
+        self._provider_reconnect_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
@@ -222,6 +242,15 @@ class AvatarSession(BaseAvatarSession):
         self._clear_generation = 0
         self._provider_recovery_in_flight = False
         self._clear_during_provider_recovery = False
+        self._provider_reconnect_task: asyncio.Task[bool] | None = None
+        self._provider_connection_state = "disconnected"
+        self._provider_generation = 0
+        self._provider_session_generation = 0
+        self._provider_expected_close_generations: set[int] = set()
+        self._provider_recovery_pending_playback = False
+        self._provider_terminal_failure = False
+        self._livekit_egress: LiveKitEgressConfig | None = None
+        self._resolved_sample_rate: int | None = None
         self._local_segment_sequence = 0
         self._resume_buffer_max_seconds = self._float_env(
             "SPATIALREAL_RESUME_BUFFER_MAX_SECONDS",
@@ -311,23 +340,39 @@ class AvatarSession(BaseAvatarSession):
 
         self._agent_session = agent_session
         self._room = room
+        self._livekit_egress = livekit_egress
+        self._resolved_sample_rate = resolved_sample_rate
         self._original_audio_output = agent_session.output.audio
         self._original_audio_tail = self._resolve_audio_tail(agent_session.output.audio)
 
         try:
-            self._avatarkit_session = new_avatar_session(
-                api_key=self._api_key,
-                app_id=self._app_id,
-                avatar_id=self._avatar_id,
-                console_endpoint_url=self._console_endpoint_url,
-                ingress_endpoint_url=self._ingress_endpoint_url,
-                expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
-                livekit_egress=livekit_egress,
-                sample_rate=resolved_sample_rate,
-                transport_frames=self._on_transport_frame,
+            last_provider_error: Exception | None = None
+            for attempt, delay in enumerate(PROVIDER_RECONNECT_DELAYS_SECONDS, start=1):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                try:
+                    async with self._provider_io_lock:
+                        await self._connect_fresh_provider_session()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    last_provider_error = error
+                    logger.warning(
+                        "SpatialReal provider startup attempt failed",
+                        exc_info=error,
+                        extra={"attempt": attempt},
+                    )
+            else:
+                assert last_provider_error is not None
+                raise last_provider_error
+
+            self._provider_connection_state = "connected"
+            self._emit_provider_connection_state(
+                state="connected",
+                reason="initial_start",
+                attempt=attempt,
             )
-            await self._avatarkit_session.init()
-            await self._avatarkit_session.start()
 
             # wait_playback_start defers the framework's playback_started event
             # (transcript sync, first-frame metrics) until we observe the avatar
@@ -528,8 +573,6 @@ class AvatarSession(BaseAvatarSession):
                 if not self._avatarkit_session:
                     return
 
-                # send_audio can fail after the provider accepted bytes. Stop the
-                # provider attempt even when no request ID was returned locally.
                 try:
                     await self._avatarkit_session.interrupt()
                 except Exception:
@@ -571,7 +614,226 @@ class AvatarSession(BaseAvatarSession):
             self._provider_recovery_in_flight = False
             self._clear_during_provider_recovery = False
 
+        recovered = await self._ensure_provider_connection(
+            reason=f"audio_forwarding_error:{self._format_error_reason(error)}"
+        )
+        if not recovered:
+            self._drop_frames_until_segment_end = True
+
+    def _create_provider_session(self) -> AvatarkitSession:
+        if self._livekit_egress is None or self._resolved_sample_rate is None:
+            raise SpatialRealException("SpatialReal provider configuration is unavailable")
+
+        self._provider_generation += 1
+        generation = self._provider_generation
+        provider = new_avatar_session(
+            api_key=self._api_key,
+            app_id=self._app_id,
+            avatar_id=self._avatar_id,
+            console_endpoint_url=self._console_endpoint_url,
+            ingress_endpoint_url=self._ingress_endpoint_url,
+            expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
+            livekit_egress=self._livekit_egress,
+            sample_rate=self._resolved_sample_rate,
+            transport_frames=self._on_transport_frame,
+            on_error=lambda error: self._on_provider_error(generation, error),
+            on_close=lambda: self._on_provider_close(generation),
+        )
+        self._provider_session_generation = generation
+        return provider
+
+    async def _connect_fresh_provider_session(self) -> AvatarkitSession:
+        provider = self._create_provider_session()
+        generation = self._provider_session_generation
+        self._avatarkit_session = provider
+
+        async def _start() -> None:
+            await provider.init()
+            await provider.start()
+
+        try:
+            await asyncio.wait_for(_start(), timeout=PROVIDER_CONNECT_TIMEOUT_SECONDS)
+        except BaseException:
+            await self._close_provider_session(provider, generation=generation)
+            if self._avatarkit_session is provider:
+                self._avatarkit_session = None
+            raise
+        return provider
+
+    async def _close_provider_session(
+        self,
+        provider: AvatarkitSession,
+        *,
+        generation: int,
+    ) -> None:
+        self._provider_expected_close_generations.add(generation)
+        try:
+            await asyncio.wait_for(
+                provider.close(),
+                timeout=PROVIDER_CLOSE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "SpatialReal provider close did not complete cleanly",
+                exc_info=error,
+                extra={"generation": generation},
+            )
+        finally:
+            self._provider_expected_close_generations.discard(generation)
+
+    def _on_provider_error(self, generation: int, error: Exception) -> None:
+        if generation != self._provider_session_generation or self._closing:
+            return
+        logger.error(
+            "SpatialReal provider websocket reported an error",
+            exc_info=error,
+            extra={"generation": generation},
+        )
+        self._schedule_provider_recovery(reason=f"provider_error:{self._format_error_reason(error)}")
+
+    def _on_provider_close(self, generation: int) -> None:
+        if (
+            generation in self._provider_expected_close_generations
+            or generation != self._provider_session_generation
+            or self._closing
+        ):
+            return
+        logger.warning(
+            "SpatialReal provider websocket closed unexpectedly",
+            extra={"generation": generation},
+        )
+        self._schedule_provider_recovery(reason="provider_closed")
+
+    def _schedule_provider_recovery(self, *, reason: str) -> asyncio.Task[bool] | None:
+        if self._closing:
+            return None
+        task = self._provider_reconnect_task
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(
+            self._recover_provider_connection(reason=reason),
+            name="spatialreal_provider_reconnect",
+        )
+        self._provider_reconnect_task = task
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def _ensure_provider_connection(self, *, reason: str) -> bool:
+        task = self._schedule_provider_recovery(reason=reason)
+        if task is None:
+            return False
+        return await asyncio.shield(task)
+
+    async def _recover_provider_connection(self, *, reason: str) -> bool:
+        async with self._provider_reconnect_lock:
+            if self._closing:
+                return False
+            if self._provider_terminal_failure:
+                return False
+
+            self._provider_connection_state = "recovering"
+            self._provider_recovery_pending_playback = False
+            self._emit_provider_connection_state(
+                state="recovering",
+                reason=reason,
+                attempt=0,
+            )
+
+            last_error: Exception | None = None
+            for attempt, delay in enumerate(PROVIDER_RECONNECT_DELAYS_SECONDS, start=1):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if self._closing:
+                    return False
+
+                try:
+                    async with self._provider_io_lock:
+                        provider = self._avatarkit_session
+                        if provider is not None:
+                            generation = self._provider_session_generation
+                            await self._close_provider_session(
+                                provider,
+                                generation=generation,
+                            )
+                            if self._avatarkit_session is provider:
+                                self._avatarkit_session = None
+
+                        # Always create a fresh AvatarKit session. Reusing the
+                        # closed object also reuses its private request state,
+                        # which can correlate a new WebSocket with the failed
+                        # request from the old connection.
+                        await self._connect_fresh_provider_session()
+
+                    self._provider_connection_state = "connected"
+                    self._provider_recovery_pending_playback = True
+                    logger.info(
+                        "SpatialReal provider websocket reconnected; awaiting observed avatar playback",
+                        extra={
+                            "attempt": attempt,
+                            "generation": self._provider_session_generation,
+                            "reason": reason,
+                        },
+                    )
+                    self._emit_provider_connection_state(
+                        state="connected",
+                        reason="reconnected_awaiting_playback",
+                        attempt=attempt,
+                    )
+                    return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    last_error = error
+                    logger.warning(
+                        "SpatialReal provider reconnect attempt failed",
+                        exc_info=error,
+                        extra={"attempt": attempt, "reason": reason},
+                    )
+
+            self._provider_terminal_failure = True
+            self._provider_connection_state = "failed"
+            failure_reason = f"{reason}:{self._format_error_reason(last_error)}" if last_error is not None else reason
+            logger.error(
+                "SpatialReal provider recovery exhausted; full room restart required",
+                extra={"reason": failure_reason},
+            )
+            self._emit_provider_connection_state(
+                state="failed",
+                reason=failure_reason,
+                attempt=len(PROVIDER_RECONNECT_DELAYS_SECONDS),
+            )
+            return False
+
+    def _emit_provider_connection_state(
+        self,
+        *,
+        state: Literal["connected", "recovering", "recovered", "failed"],
+        reason: str,
+        attempt: int,
+    ) -> None:
+        self.emit(
+            "provider_connection_state_changed",
+            AvatarProviderConnectionEvent(
+                state=state,
+                reason=reason,
+                attempt=attempt,
+                generation=self._provider_session_generation,
+                observed_at=time.time(),
+            ),
+        )
+
+    async def disconnect_provider_for_test(self) -> None:
+        """Close the ingress WebSocket so staging can verify provider recovery."""
+        if self._closing or self._avatarkit_session is None:
+            raise SpatialRealException("SpatialReal provider session is unavailable")
+        await self._avatarkit_session.close()
+
     async def _send_audio_frame(self, frame: rtc.AudioFrame) -> None:
+        if self._provider_terminal_failure:
+            raise SpatialRealException("SpatialReal provider recovery is exhausted")
         if not self._avatarkit_session:
             return
 
@@ -1021,10 +1283,8 @@ class AvatarSession(BaseAvatarSession):
             self._mark_playback_started(segment, source="livekit_active_speaker")
 
     def _playback_observation_suspended(self) -> bool:
-        # While a pause is in flight or held, the egress is still draining the
-        # audio of the interrupted attempt. Observing that tail as the start of
-        # the paused/resumed attempt would anchor its completion estimate at the
-        # pause instant and report playback_finished several seconds early.
+        # SpatialReal 1.7.1 correction: an egress tail that is draining while
+        # paused is not the start of the resumed attempt.
         return self._pause_requested or self._paused_segment is not None
 
     def _on_track_published(
@@ -1153,6 +1413,22 @@ class AvatarSession(BaseAvatarSession):
                 observed_at=segment.playback_started_at,
             ),
         )
+        if self._provider_recovery_pending_playback:
+            self._provider_recovery_pending_playback = False
+            self._provider_connection_state = "recovered"
+            logger.info(
+                "SpatialReal provider recovery confirmed by observed avatar playback",
+                extra={
+                    "request_id": segment.req_id,
+                    "source": source,
+                    "generation": self._provider_session_generation,
+                },
+            )
+            self._emit_provider_connection_state(
+                state="recovered",
+                reason=f"playback_observed:{source}",
+                attempt=0,
+            )
 
     @staticmethod
     def _extract_req_id_from_transport_frame(frame: bytes) -> str | None:
@@ -1688,6 +1964,11 @@ class AvatarSession(BaseAvatarSession):
             self._clear_generation = 0
             self._provider_recovery_in_flight = False
             self._clear_during_provider_recovery = False
+            self._provider_reconnect_task = None
+            self._provider_connection_state = "disconnected"
+            self._provider_recovery_pending_playback = False
+            self._provider_terminal_failure = False
+            self._provider_expected_close_generations.clear()
 
             self._detach_audio_output()
             self._original_audio_output = None
@@ -1709,3 +1990,5 @@ class AvatarSession(BaseAvatarSession):
 
             self._initialized = False
             self._agent_session = None
+            self._livekit_egress = None
+            self._resolved_sample_rate = None

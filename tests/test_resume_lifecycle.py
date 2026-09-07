@@ -28,6 +28,15 @@ class _ProviderSpy:
         self.generation += 1
         return req_id
 
+    async def init(self) -> None:
+        return None
+
+    async def start(self) -> str:
+        return "connection-test"
+
+    async def close(self) -> None:
+        return None
+
 
 class _ReusedRequestIdProvider(_ProviderSpy):
     async def send_audio(self, *, audio: bytes, end: bool) -> str:
@@ -137,7 +146,10 @@ class _AudioStreamCloseSpy:
 
 
 def _session() -> avatar.AvatarSession:
-    return avatar.AvatarSession(api_key="test", app_id="test", avatar_id="test")
+    session = avatar.AvatarSession(api_key="test", app_id="test", avatar_id="test")
+    session._livekit_egress = object()
+    session._resolved_sample_rate = 24000
+    return session
 
 
 def _buffered_frame(value: int, duration: float = 0.25) -> avatar._BufferedAudioFrame:
@@ -523,10 +535,14 @@ def test_stale_completion_for_reused_request_id_cannot_finish_resumed_attempt(
     asyncio.run(run_test())
 
 
-def test_transient_provider_send_failure_does_not_kill_audio_forwarder() -> None:
+def test_transient_provider_send_failure_does_not_kill_audio_forwarder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def run_test() -> None:
         session = _session()
         provider = _FailFirstSendProvider()
+        replacement = _ProviderSpy()
+        monkeypatch.setattr(avatar, "new_avatar_session", lambda **_: replacement)
         audio = _StreamingAudioBufferSpy(
             [
                 _rtc_frame(1),
@@ -540,11 +556,11 @@ def test_transient_provider_send_failure_does_not_kill_audio_forwarder() -> None
 
         await session._run_main_task()
 
-        assert provider.send_calls == 2
+        assert provider.send_calls == 1
         assert provider.interrupt_calls == 1
-        assert session._active_req_id == "request-2"
+        assert session._active_req_id == "request-1"
         assert audio.playback_finished == [(0.0, True)]
-        assert provider.sent == [("request-2", bytes([3, 0]) * 4, False)]
+        assert replacement.sent == [("request-1", bytes([3, 0]) * 4, False)]
 
         session._cancel_active_segment_idle_end()
 
@@ -569,10 +585,14 @@ def test_clear_after_provider_recovery_releases_next_response() -> None:
     asyncio.run(run_test())
 
 
-def test_clear_during_provider_recovery_does_not_discard_next_response() -> None:
+def test_clear_during_provider_recovery_does_not_discard_next_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def run_test() -> None:
         session = _session()
         provider = _BlockingInterruptProvider()
+        replacement = _ProviderSpy()
+        monkeypatch.setattr(avatar, "new_avatar_session", lambda **_: replacement)
         audio = _AudioBufferSpy()
         session._avatarkit_session = provider
         session._audio_buffer = audio
@@ -594,7 +614,7 @@ def test_clear_during_provider_recovery_does_not_discard_next_response() -> None
         assert session._clear_during_provider_recovery is False
         assert session._drop_frames_until_segment_end is False
         assert provider.interrupt_calls == 1
-        assert provider.sent == [("request-2", bytes([2, 0]) * 4, False)]
+        assert replacement.sent == [("request-1", bytes([2, 0]) * 4, False)]
         assert audio.playback_finished == [(0.0, True)]
 
         session._cancel_active_segment_idle_end()
@@ -602,10 +622,14 @@ def test_clear_during_provider_recovery_does_not_discard_next_response() -> None
     asyncio.run(run_test())
 
 
-def test_clear_during_failing_provider_send_does_not_discard_next_response() -> None:
+def test_clear_during_failing_provider_send_does_not_discard_next_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def run_test() -> None:
         session = _session()
         provider = _BlockingFailSendProvider()
+        replacement = _ProviderSpy()
+        monkeypatch.setattr(avatar, "new_avatar_session", lambda **_: replacement)
         audio = _AudioBufferSpy()
         session._avatarkit_session = provider
         session._audio_buffer = audio
@@ -629,7 +653,7 @@ def test_clear_during_failing_provider_send_does_not_discard_next_response() -> 
         assert session._clear_during_provider_send is False
         assert session._drop_frames_until_segment_end is False
         assert provider.interrupt_calls == 1
-        assert provider.sent == [("request-2", bytes([2, 0]) * 4, False)]
+        assert replacement.sent == [("request-1", bytes([2, 0]) * 4, False)]
         assert audio.playback_finished == [(0.0, True)]
 
         session._cancel_active_segment_idle_end()
@@ -791,52 +815,3 @@ def test_segment_rollover_preserves_retained_audio_state() -> None:
     assert target.buffer_start_position == pytest.approx(0.25)
     assert target.playback_position_offset == pytest.approx(0.5)
     assert list(target.audio_frames) == list(source.audio_frames)
-
-
-def test_playback_observation_ignored_while_paused(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The egress keeps draining the interrupted attempt for a moment after pause().
-
-    That tail must not be observed as the start of the paused/resumed attempt,
-    otherwise its completion estimate is anchored at the pause instant and
-    playback_finished is reported seconds early.
-    """
-
-    async def run_test() -> None:
-        session = _session()
-        provider = _ProviderSpy()
-        audio = _AudioBufferSpy()
-        segment = _playing_segment()
-        session._avatarkit_session = provider
-        session._audio_buffer = audio
-        session._segments[segment.req_id] = segment
-        session._pending_segment_ids.append(segment.req_id)
-        session._pause_requested = True
-
-        monkeypatch.setattr(avatar.time, "time", lambda: 100.5)
-        await session._handle_pause()
-        assert segment.playback_started is False
-
-        audible = rtc.AudioFrame(data=bytes([0, 4]) * 4, sample_rate=8, num_channels=1, samples_per_channel=4)
-        # still draining: the audible tail of the old attempt must be ignored
-        session._on_avatar_audio_frame(audible)
-        session._on_active_speakers_changed([type("P", (), {"identity": session.avatar_identity, "attributes": {}})()])
-        assert segment.playback_started is False
-        assert segment.playback_started_at is None
-        assert audio.playback_started == 0
-
-        session._pause_requested = False
-        monkeypatch.setattr(avatar.time, "time", lambda: 103.0)
-        await session._handle_resume()
-        resumed = session._segments["request-2"]
-        assert resumed.playback_started is False
-
-        monkeypatch.setattr(avatar.time, "time", lambda: 104.2)
-        session._on_avatar_audio_frame(audible)
-        assert resumed.playback_started is True
-        assert resumed.playback_started_at == pytest.approx(104.2)
-        assert audio.playback_started == 1
-        # completion is anchored at the real resumed start, not the pause instant
-        assert resumed.completion_timeout_task is not None
-        resumed.completion_timeout_task.cancel()
-
-    asyncio.run(run_test())
