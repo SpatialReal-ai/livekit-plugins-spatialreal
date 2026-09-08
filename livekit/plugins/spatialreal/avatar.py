@@ -23,9 +23,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from avatarkit import AvatarSession as AvatarkitSession
-from avatarkit import LiveKitEgressConfig, new_avatar_session
-from avatarkit.proto.generated import message_pb2 as _message_pb2
 from livekit.agents import (
     NOT_GIVEN,
     AgentSession,
@@ -39,11 +36,11 @@ from livekit.agents.voice.io import AudioOutput
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import api, rtc
+from spatialreal import AvatarSession as AvatarkitSession
+from spatialreal import LiveKitEgressConfig, PlaybackSignal, new_avatar_session
 
 from .log import logger
 from .resumable_queue_io import ResumableQueueAudioOutput
-
-message_pb2: Any = _message_pb2
 
 __all__ = [
     "AvatarPlaybackStartedEvent",
@@ -635,7 +632,7 @@ class AvatarSession(BaseAvatarSession):
             expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
             livekit_egress=self._livekit_egress,
             sample_rate=self._resolved_sample_rate,
-            transport_frames=self._on_transport_frame,
+            on_playback=self._on_playback_signal,
             on_error=lambda error: self._on_provider_error(generation, error),
             on_close=lambda: self._on_provider_close(generation),
         )
@@ -1181,8 +1178,9 @@ class AvatarSession(BaseAvatarSession):
                     extra={"request_id": req_id, "timeout": timeout},
                 )
 
-    def _on_transport_frame(self, frame: bytes, is_last: bool) -> None:
-        req_id = self._extract_req_id_from_transport_frame(frame)
+    def _on_playback_signal(self, signal: PlaybackSignal) -> None:
+        req_id = signal.req_id or None
+        is_last = signal.end
         if req_id is not None and req_id in self._recently_completed_req_ids:
             logger.debug(
                 "Ignoring duplicate provider event for completed request",
@@ -1429,20 +1427,6 @@ class AvatarSession(BaseAvatarSession):
                 reason=f"playback_observed:{source}",
                 attempt=0,
             )
-
-    @staticmethod
-    def _extract_req_id_from_transport_frame(frame: bytes) -> str | None:
-        try:
-            envelope = message_pb2.Message()
-            envelope.ParseFromString(frame)
-        except Exception:
-            return None
-
-        if envelope.type != message_pb2.MESSAGE_SERVER_RESPONSE_ANIMATION:
-            return None
-
-        req_id = envelope.server_response_animation.req_id
-        return req_id or None
 
     def _complete_segment(self, *, req_id: str, interrupted: bool, reason: str) -> bool:
         segment = self._segments.pop(req_id, None)
