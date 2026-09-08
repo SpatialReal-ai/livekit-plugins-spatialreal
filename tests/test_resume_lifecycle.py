@@ -5,6 +5,7 @@ from collections import deque
 
 import pytest
 from livekit.agents.voice.avatar import AudioSegmentEnd
+from spatialreal import PlaybackSignal
 
 from livekit import rtc
 from livekit.plugins.spatialreal import avatar
@@ -525,9 +526,7 @@ def test_stale_completion_for_reused_request_id_cannot_finish_resumed_attempt(
         await session._handle_pause()
         session._pause_requested = False
         await session._handle_resume()
-        monkeypatch.setattr(session, "_extract_req_id_from_transport_frame", lambda _: "request-1")
-
-        session._on_transport_frame(b"stale", True)
+        session._on_playback_signal(PlaybackSignal(req_id="request-1", end=True))
 
         assert session._segments["request-1"] is segment
         assert audio.playback_finished == []
@@ -785,13 +784,7 @@ def test_stale_completion_for_reused_request_id_cannot_finish_normal_attempt(
 
         await session._send_audio_frame(_rtc_frame())
         segment = session._segments["request-1"]
-        monkeypatch.setattr(
-            session,
-            "_extract_req_id_from_transport_frame",
-            lambda _: "request-1",
-        )
-
-        session._on_transport_frame(b"stale", True)
+        session._on_playback_signal(PlaybackSignal(req_id="request-1", end=True))
 
         assert segment.provider_events_trusted is False
         assert session._segments["request-1"] is segment

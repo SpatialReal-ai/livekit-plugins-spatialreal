@@ -1,6 +1,6 @@
 """Offline lifecycle tests for the SpatialReal avatar plugin.
 
-Runs without network or a LiveKit room: avatarkit and the audio buffer are
+Runs without network or a LiveKit room: the spatialreal SDK session and audio buffer are
 stubbed, and the segment state machine is driven directly.
 
 Usage: .venv/bin/python tests/test_lifecycle.py
@@ -17,9 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from avatarkit.proto.generated import message_pb2  # noqa: E402
 from livekit.agents.voice import io as voice_io  # noqa: E402
 from livekit.agents.voice.avatar import QueueAudioOutput  # noqa: E402
+from spatialreal import PlaybackSignal  # noqa: E402
 
 from livekit import rtc  # noqa: E402
 from livekit.plugins.spatialreal.avatar import AvatarSession  # noqa: E402
@@ -71,12 +71,8 @@ def make_frame(samples: int = 240, sample_rate: int = 24000) -> rtc.AudioFrame:
     return rtc.AudioFrame.create(sample_rate=sample_rate, num_channels=1, samples_per_channel=samples)
 
 
-def provider_end_frame(req_id: str) -> bytes:
-    envelope = message_pb2.Message()
-    envelope.type = message_pb2.MESSAGE_SERVER_RESPONSE_ANIMATION
-    envelope.server_response_animation.req_id = req_id
-    envelope.server_response_animation.end = True
-    return envelope.SerializeToString()
+def provider_end_signal(req_id: str) -> PlaybackSignal:
+    return PlaybackSignal(req_id=req_id, end=True)
 
 
 async def test_early_provider_completion_is_preserved() -> None:
@@ -84,7 +80,7 @@ async def test_early_provider_completion_is_preserved() -> None:
 
     await session._send_audio_frame(make_frame())
     # provider completion arrives BEFORE the local AudioSegmentEnd
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started"], buffer.events
 
     assert await session._finalize_active_segment(source="segment_end")
@@ -275,12 +271,12 @@ async def test_duplicate_provider_end_ignored() -> None:
 
     await session._send_audio_frame(make_frame())
     assert await session._finalize_active_segment(source="segment_end")
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started", ("finished", False)], buffer.events
 
     # egress ALR retransmission can re-deliver end=true for the same req_id
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started", ("finished", False)], buffer.events
     assert not session._early_provider_started_ids and not session._early_provider_completed_ids
     print("PASS duplicate provider end=true events are ignored")
