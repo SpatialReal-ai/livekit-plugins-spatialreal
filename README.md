@@ -37,6 +37,9 @@ SPATIALREAL_CONSOLE_ENDPOINT=
 SPATIALREAL_INGRESS_ENDPOINT=
 # Max seconds of per-response audio retained for false-interruption resume (default 180, min 10)
 SPATIALREAL_RESUME_BUFFER_MAX_SECONDS=
+# TTL (seconds) of the LiveKit room-join token the egress worker uses; must outlive
+# the whole session so mid-session reconnects don't hit an expired token (default 86400)
+SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS=
 
 # LiveKit credentials
 LIVEKIT_URL=
@@ -111,6 +114,7 @@ Main class for integrating SpatialReal avatars with LiveKit agents.
 | `avatar_participant_name` | `str` | LiveKit display name for avatar participant |
 | `idle_timeout_seconds` | `int` | LiveKit egress idle timeout in seconds (`0` uses server defaults) |
 | `sample_rate` | `int \| None` | Optional avatar audio sample rate override |
+| `livekit_token_ttl_seconds` | `int` | TTL of the LiveKit room-join token used by the egress worker; must outlive the whole session (or `SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS`; default 86400) |
 
 #### Methods
 
