@@ -69,6 +69,14 @@ AVATAR_AUDIO_ACTIVITY_THRESHOLD = 100
 COMPLETED_REQ_ID_HISTORY = 32
 DEFAULT_RESUME_BUFFER_MAX_SECONDS = 180.0
 DEFAULT_SESSION_TTL = timedelta(hours=1)
+# TTL of the LiveKit room-join token the egress worker uses to (re)join the room.
+# This is NOT the SpatialReal session lifetime — the egress worker keeps re-joining
+# the SFU across the whole session, including after a provider-WS reconnect, so the
+# token must outlive any realistic conversation. When it expires mid-session, egress
+# rejoins with a stale token and the SFU returns 401, which the plugin surfaces as an
+# unrecoverable provider failure and the avatar drops out. Default 24h; override with
+# SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS or the livekit_token_ttl constructor arg.
+DEFAULT_LIVEKIT_TOKEN_TTL = timedelta(hours=24)
 LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
 PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
@@ -153,6 +161,7 @@ class AvatarSession(BaseAvatarSession):
         avatar_participant_name: NotGivenOr[str] = NOT_GIVEN,
         idle_timeout_seconds: int = 0,
         sample_rate: NotGivenOr[int] = NOT_GIVEN,
+        livekit_token_ttl_seconds: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         super().__init__()
         resolved_api_key = api_key if utils.is_given(api_key) else os.getenv("SPATIALREAL_API_KEY")
@@ -180,6 +189,15 @@ class AvatarSession(BaseAvatarSession):
             raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
         if utils.is_given(sample_rate) and sample_rate <= 0:
             raise SpatialRealException("sample_rate must be greater than 0")
+
+        resolved_livekit_token_ttl = (
+            int(livekit_token_ttl_seconds)
+            if utils.is_given(livekit_token_ttl_seconds)
+            else self._int_env("SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS", int(DEFAULT_LIVEKIT_TOKEN_TTL.total_seconds()))
+        )
+        if resolved_livekit_token_ttl <= 0:
+            raise SpatialRealException("livekit_token_ttl_seconds must be greater than 0")
+        self._livekit_token_ttl = timedelta(seconds=resolved_livekit_token_ttl)
 
         self._api_key = str(resolved_api_key)
         self._app_id = str(resolved_app_id)
@@ -309,7 +327,7 @@ class AvatarSession(BaseAvatarSession):
             .with_kind("agent")
             .with_identity(self._avatar_participant_identity)
             .with_name(self._avatar_participant_name)
-            .with_ttl(DEFAULT_SESSION_TTL)
+            .with_ttl(self._livekit_token_ttl)
             .with_attributes(egress_attributes)
             .with_grants(
                 api.VideoGrants(
@@ -486,6 +504,21 @@ class AvatarSession(BaseAvatarSession):
         if message:
             return f"{type(root_error).__name__}: {message}"
         return type(root_error).__name__
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("%s=%r is invalid; using %d", name, raw, default)
+            return default
+        if value <= 0:
+            logger.warning("%s=%d must be > 0; using %d", name, value, default)
+            return default
+        return value
 
     @staticmethod
     def _float_env(name: str, default: float, *, minimum: float) -> float:

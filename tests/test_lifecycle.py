@@ -295,8 +295,47 @@ async def main() -> None:
     await test_active_speaker_secondary_signal()
     await test_audio_tail_attach_and_restore()
     await test_audio_tail_restore_without_wrappers()
+    await test_livekit_egress_token_ttl_outlives_session()
     print("ALL TESTS PASSED")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+async def test_livekit_egress_token_ttl_outlives_session() -> None:
+    """The egress LiveKit room-join token must outlive a long conversation.
+
+    Regression for the 1h-TTL bug: after the token expired mid-session, an
+    egress rejoin (triggered by a provider-WS reconnect) hit SFU 401 and the
+    avatar dropped out permanently. The token TTL is decoupled from the
+    SpatialReal session TTL and defaults to 24h.
+    """
+    import base64
+    import json
+    from datetime import timedelta
+
+    from livekit.plugins.spatialreal.avatar import DEFAULT_LIVEKIT_TOKEN_TTL
+
+    assert DEFAULT_LIVEKIT_TOKEN_TTL >= timedelta(hours=12)
+
+    session = AvatarSession(api_key="k", app_id="a", avatar_id="av")
+    assert session._livekit_token_ttl == DEFAULT_LIVEKIT_TOKEN_TTL
+
+    # mint a token the same way start() does and decode its exp/nbf claims
+    from livekit import api
+
+    jwt = (
+        api.AccessToken(api_key="devkey", api_secret="secret" * 6)
+        .with_identity("spatialreal-avatar")
+        .with_ttl(session._livekit_token_ttl)
+        .to_jwt()
+    )
+    payload = jwt.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    assert claims["exp"] - claims["nbf"] >= 12 * 3600, claims
+
+    override = AvatarSession(api_key="k", app_id="a", avatar_id="av", livekit_token_ttl_seconds=7200)
+    assert override._livekit_token_ttl == timedelta(seconds=7200)
+    print("PASS egress LiveKit token TTL is long (>=12h default) and configurable")
