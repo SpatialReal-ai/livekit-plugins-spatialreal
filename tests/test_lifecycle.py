@@ -41,6 +41,14 @@ class FakeAvatarkitSession:
         self.interrupt_calls += 1
         return self.req_id
 
+    async def pause(self) -> str:
+        self.pause_calls = getattr(self, "pause_calls", 0) + 1
+        return self.req_id
+
+    async def resume(self) -> str:
+        self.resume_calls = getattr(self, "resume_calls", 0) + 1
+        return self.req_id
+
     async def close(self) -> None:
         pass
 
@@ -292,6 +300,9 @@ async def main() -> None:
     await test_audio_tail_attach_and_restore()
     await test_audio_tail_restore_without_wrappers()
     await test_livekit_egress_token_ttl_outlives_session()
+    await test_native_pause_resume_keeps_audio_flowing()
+    await test_pause_timeout_finalizes_segment_interrupted()
+    await test_non_pause_timeout_playback_state_is_noop()
     print("ALL TESTS PASSED")
 
 
@@ -335,3 +346,83 @@ async def test_livekit_egress_token_ttl_outlives_session() -> None:
     override = AvatarSession(api_key="k", app_id="a", avatar_id="av", livekit_token_ttl_seconds=7200)
     assert override._livekit_token_ttl == timedelta(seconds=7200)
     print("PASS egress LiveKit token TTL is long (>=12h default) and configurable")
+
+
+async def test_native_pause_resume_keeps_audio_flowing() -> None:
+    """With server playback_control, pause/resume drive the SDK directly and do
+    NOT interrupt, retain, or divert frames — the segment stays active."""
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    active = session._active_req_id
+    assert active is not None
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # native pause: SDK.pause() called, NOT interrupt; no frame diversion
+    assert getattr(fake, "pause_calls", 0) == 1
+    assert fake.interrupt_calls == 0
+    assert session._pause_requested is False
+    assert session._paused_segment is None
+    assert session._active_req_id == active  # segment untouched
+
+    # audio keeps flowing to the same request while paused
+    await session._send_audio_frame(make_frame())
+    assert session._active_req_id == active
+
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert getattr(fake, "resume_calls", 0) == 1
+    assert buffer.events == []  # never completed; still playing
+
+    session._complete_segment(req_id=active, interrupted=False, reason="test")
+    print("PASS native pause/resume drives SDK without interrupt/retain/divert")
+
+
+async def test_pause_timeout_finalizes_segment_interrupted() -> None:
+    """A server-forced pause_timeout interrupt must finalize the segment so the
+    framework's speech handle isn't stranded."""
+    from spatialreal import InterruptReason, PlaybackState, PlaybackStateEvent
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+
+    session._on_playback_state(
+        PlaybackStateEvent(
+            req_id=req, state=PlaybackState.INTERRUPTED, played_ms=1500, reason=InterruptReason.PAUSE_TIMEOUT
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    assert buffer.events and buffer.events[-1] == ("finished", True)
+    assert not session._segments
+    print("PASS pause_timeout finalizes the segment as interrupted")
+
+
+async def test_non_pause_timeout_playback_state_is_noop() -> None:
+    """explicit/preempted interrupts flow through clear_buffer, not this path."""
+    from spatialreal import InterruptReason, PlaybackState, PlaybackStateEvent
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+    await session._send_audio_frame(make_frame())
+
+    session._on_playback_state(
+        PlaybackStateEvent(
+            req_id=session._active_req_id, state=PlaybackState.INTERRUPTED, reason=InterruptReason.EXPLICIT
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    # not finalized here — the framework's own clear_buffer owns explicit interrupts
+    assert buffer.events == []
+    session._complete_segment(req_id=session._active_req_id, interrupted=True, reason="test")
+    print("PASS non-pause_timeout playback-state is a no-op on this path")
