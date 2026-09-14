@@ -37,7 +37,14 @@ from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import api, rtc
 from spatialreal import AvatarSession as AvatarkitSession
-from spatialreal import LiveKitEgressConfig, PlaybackSignal, new_avatar_session
+from spatialreal import (
+    InterruptReason,
+    LiveKitEgressConfig,
+    PlaybackSignal,
+    PlaybackState,
+    PlaybackStateEvent,
+    new_avatar_session,
+)
 
 from .log import logger
 from .resumable_queue_io import ResumableQueueAudioOutput
@@ -247,6 +254,7 @@ class AvatarSession(BaseAvatarSession):
         self._close_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
+        self._server_playback_control = False
         self._pause_requested = False
         self._pause_requested_at: float | None = None
         self._discard_requested = False
@@ -666,6 +674,7 @@ class AvatarSession(BaseAvatarSession):
             livekit_egress=self._livekit_egress,
             sample_rate=self._resolved_sample_rate,
             on_playback=self._on_playback_signal,
+            on_playback_state=self._on_playback_state,
             on_error=lambda error: self._on_provider_error(generation, error),
             on_close=lambda: self._on_provider_close(generation),
         )
@@ -688,6 +697,11 @@ class AvatarSession(BaseAvatarSession):
             if self._avatarkit_session is provider:
                 self._avatarkit_session = None
             raise
+
+        # When the backend advertises server-side playback control we drive
+        # false-interruption pause/resume natively (no interrupt + re-send).
+        # Feature-detected per connection so a mixed fleet degrades gracefully.
+        self._server_playback_control = "playback_control" in getattr(provider, "capabilities", ())
         return provider
 
     async def _close_provider_session(
@@ -1211,6 +1225,30 @@ class AvatarSession(BaseAvatarSession):
                     extra={"request_id": req_id, "timeout": timeout},
                 )
 
+    def _on_playback_state(self, event: PlaybackStateEvent) -> None:
+        # Structured server-side playback state (egress playback_control). The
+        # PLAYING/PAUSED/ENDED signals are already handled via on_playback
+        # (ServerResponseAnimation); the one thing that path can't express is a
+        # server-forced interrupt of a held pause — surface that here so the
+        # framework's speech handle isn't left hanging on a segment the server
+        # has abandoned.
+        if event.state != PlaybackState.INTERRUPTED:
+            return
+        if event.reason != InterruptReason.PAUSE_TIMEOUT:
+            # explicit / preempted interrupts already flow through the framework's
+            # own clear_buffer path; nothing extra to do.
+            return
+        logger.warning(
+            "SpatialReal avatar pause timed out on the server; finalizing segment as interrupted",
+            extra={"request_id": event.req_id, "played_ms": event.played_ms},
+        )
+        self._discard_requested = True
+        self._pause_requested = False
+        self._spawn_background_task(
+            self._handle_interrupt(),
+            name="spatialreal_avatar_pause_timeout",
+        )
+
     def _on_playback_signal(self, signal: PlaybackSignal) -> None:
         req_id = signal.req_id or None
         is_last = signal.end
@@ -1589,9 +1627,18 @@ class AvatarSession(BaseAvatarSession):
     def _on_pause(self) -> None:
         if self._closing or self._drop_frames_until_segment_end:
             return
+        self._discard_requested = False
+        if self._server_playback_control:
+            # Native path: the server holds its send cursor and keeps ingesting,
+            # so we must NOT set _pause_requested (which diverts/retains frames)
+            # — audio keeps flowing to the same request untouched.
+            self._spawn_background_task(
+                self._handle_pause_native(),
+                name="spatialreal_avatar_pause_native",
+            )
+            return
         self._pause_requested = True
         self._pause_requested_at = time.time()
-        self._discard_requested = False
         self._spawn_background_task(
             self._handle_pause(),
             name="spatialreal_avatar_pause",
@@ -1604,10 +1651,42 @@ class AvatarSession(BaseAvatarSession):
         if self._discard_requested:
             logger.debug("Ignoring SpatialReal avatar resume after confirmed interruption")
             return
+        if self._server_playback_control:
+            self._spawn_background_task(
+                self._handle_resume_native(),
+                name="spatialreal_avatar_resume_native",
+            )
+            return
         self._spawn_background_task(
             self._handle_resume(),
             name="spatialreal_avatar_resume",
         )
+
+    async def _handle_pause_native(self) -> None:
+        """Server-side pause: hold the cursor, keep the segment and audio flow intact."""
+        if not self._avatarkit_session or self._discard_requested:
+            return
+        async with self._provider_io_lock:
+            if self._discard_requested or self._avatarkit_session is None:
+                return
+            try:
+                req_id = await self._avatarkit_session.pause()
+                logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
+            except Exception as e:
+                logger.warning("Failed to pause SpatialReal avatar playback (server-side)", exc_info=e)
+
+    async def _handle_resume_native(self) -> None:
+        """Server-side resume: continue the held cursor from where it stopped."""
+        if not self._avatarkit_session or self._discard_requested:
+            return
+        async with self._provider_io_lock:
+            if self._discard_requested or self._avatarkit_session is None:
+                return
+            try:
+                req_id = await self._avatarkit_session.resume()
+                logger.debug("SpatialReal avatar playback resumed (server-side)", extra={"request_id": req_id})
+            except Exception as e:
+                logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
 
     def _on_clear_buffer(self) -> None:
         if self._closing:
