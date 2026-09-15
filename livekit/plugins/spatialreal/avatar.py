@@ -143,6 +143,8 @@ class _SegmentState:
     attempt_duration: float = 0.0
     input_finalized: bool = False
     provider_events_trusted: bool = True
+    # set while the server holds playback (native pause); time held is not playback
+    native_paused_at: float | None = None
 
 
 class AvatarSession(BaseAvatarSession):
@@ -748,6 +750,8 @@ class AvatarSession(BaseAvatarSession):
             "SpatialReal provider websocket closed unexpectedly",
             extra={"generation": generation},
         )
+        # a server-side hold dies with its connection; fall back to duration completion
+        self._release_native_hold()
         self._schedule_provider_recovery(reason="provider_closed")
 
     def _schedule_provider_recovery(self, *, reason: str) -> asyncio.Task[bool] | None:
@@ -1194,6 +1198,10 @@ class AvatarSession(BaseAvatarSession):
 
         segment = self._segments.get(req_id)
         if segment is None:
+            return
+
+        # the server is holding playback; resume reschedules against the shifted start
+        if segment.native_paused_at is not None:
             return
 
         # if the avatar is still audibly speaking, allow a bounded overrun
@@ -1674,19 +1682,44 @@ class AvatarSession(BaseAvatarSession):
                 logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
             except Exception as e:
                 logger.warning("Failed to pause SpatialReal avatar playback (server-side)", exc_info=e)
+                return
+            segment = self._segments.get(req_id) or self._segments.get(self._active_req_id or "")
+            if segment is not None and segment.native_paused_at is None:
+                segment.native_paused_at = time.time()
 
     async def _handle_resume_native(self) -> None:
         """Server-side resume: continue the held cursor from where it stopped."""
-        if not self._avatarkit_session or self._discard_requested:
-            return
-        async with self._provider_io_lock:
-            if self._discard_requested or self._avatarkit_session is None:
+        try:
+            if not self._avatarkit_session or self._discard_requested:
                 return
-            try:
-                req_id = await self._avatarkit_session.resume()
-                logger.debug("SpatialReal avatar playback resumed (server-side)", extra={"request_id": req_id})
-            except Exception as e:
-                logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
+            async with self._provider_io_lock:
+                if self._discard_requested or self._avatarkit_session is None:
+                    return
+                try:
+                    req_id = await self._avatarkit_session.resume()
+                    logger.debug("SpatialReal avatar playback resumed (server-side)", extra={"request_id": req_id})
+                except Exception as e:
+                    logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
+        finally:
+            # released on every path (failed resume, resume during a provider
+            # reconnect) so a segment can't be stranded; a hold the server keeps
+            # anyway ends in its pause_timeout interrupt
+            self._release_native_hold()
+
+    def _release_native_hold(self) -> None:
+        """Shift held segments' playback start by the time the server held them."""
+        now = time.time()
+        for segment in self._segments.values():
+            if segment.native_paused_at is None:
+                continue
+            held = now - segment.native_paused_at
+            segment.native_paused_at = None
+            if segment.playback_started_at is not None:
+                segment.playback_started_at += held
+            elif segment.first_frame_at is not None:
+                segment.first_frame_at += held
+            if segment.req_id in self._pending_segment_ids:
+                self._schedule_segment_completion(segment)
 
     def _on_clear_buffer(self) -> None:
         if self._closing:
