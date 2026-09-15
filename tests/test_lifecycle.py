@@ -290,6 +290,81 @@ async def test_duplicate_provider_end_ignored() -> None:
     print("PASS duplicate provider end=true events are ignored")
 
 
+async def test_native_pause_defers_duration_completion() -> None:
+    """Regression (live E2E against the spatialreal.dev test backend): on the native
+    server-side path the duration-derived completion ignored the time the server held
+    playback, so the segment finished ~pause-duration before the avatar stopped talking.
+    A native pause must hold completion, and resume must push the expected end back."""
+    import time
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+    assert await session._finalize_active_segment(source="segment_end")
+    segment = session._segments[req]
+    # 10s of audio whose playback started 4s ago
+    segment.attempt_duration = 10.0
+    segment.playback_started = True
+    segment.playback_started_at = time.time() - 4.0
+    before = session._compute_completion_timeout(segment)
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # a completion timer that fires while the server holds playback must not finish the segment
+    await session._wait_for_segment_completion_timeout(req, 0)
+    assert buffer.events == [], buffer.events
+
+    await asyncio.sleep(0.3)  # server holds playback
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # the paused time does not count toward playback: remaining time is unchanged by the pause
+    after = session._compute_completion_timeout(segment)
+    assert after > before - 0.1, (before, after)
+    assert buffer.events == [], buffer.events
+
+    session._complete_segment(req_id=req, interrupted=False, reason="test")
+    print("PASS native pause holds and defers duration-derived completion")
+
+
+async def test_native_resume_without_provider_releases_hold() -> None:
+    """A resume that lands while the provider session is unavailable (reconnect window)
+    must still release the native hold; otherwise the duration fallback never completes
+    the segment and the framework's speech handle is stranded."""
+    import time
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+    assert await session._finalize_active_segment(source="segment_end")
+    segment = session._segments[req]
+    segment.attempt_duration = 10.0
+    segment.playback_started = True
+    segment.playback_started_at = time.time() - 4.0
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert segment.native_paused_at is not None
+
+    session._avatarkit_session = None  # provider reconnect in progress
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert segment.native_paused_at is None
+
+    await session._wait_for_segment_completion_timeout(req, 0)
+    assert buffer.events == [("finished", False)], buffer.events
+    print("PASS native resume during provider reconnect releases the hold")
+
+
 async def main() -> None:
     await test_early_provider_completion_is_preserved()
     await test_duplicate_provider_end_ignored()
@@ -303,6 +378,8 @@ async def main() -> None:
     await test_native_pause_resume_keeps_audio_flowing()
     await test_pause_timeout_finalizes_segment_interrupted()
     await test_non_pause_timeout_playback_state_is_noop()
+    await test_native_pause_defers_duration_completion()
+    await test_native_resume_without_provider_releases_hold()
     print("ALL TESTS PASSED")
 
 
