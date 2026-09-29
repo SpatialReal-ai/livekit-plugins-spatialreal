@@ -86,11 +86,12 @@ PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
 
-# SpatialReal's test deployment — the only one today; production is not up yet. Override
-# per session with the constructor arguments, or globally with SPATIALREAL_CONSOLE_ENDPOINT /
-# SPATIALREAL_INGRESS_ENDPOINT. The SDK appends the routes (/v1/auth/session-token, /websocket).
-DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.dev"
-DEFAULT_INGRESS_ENDPOINT = "wss://test-driven.spatialreal.dev/v2/driveningress"
+# SpatialReal's production deployment. Override per session with the constructor arguments, or
+# globally with SPATIALREAL_CONSOLE_ENDPOINT / SPATIALREAL_INGRESS_ENDPOINT (the test deployment is
+# https://api.spatialreal.dev and wss://test-driven.spatialreal.dev/v2/driveningress). The SDK
+# appends the routes (/v1/auth/session-token, /websocket).
+DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.com"
+DEFAULT_INGRESS_ENDPOINT = "wss://driven.us-west.spatialreal.cloud/v2/driveningress"
 
 
 class SpatialRealException(Exception):
