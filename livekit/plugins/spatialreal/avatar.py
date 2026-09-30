@@ -90,7 +90,7 @@ PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
 # globally with SPATIALREAL_CONSOLE_ENDPOINT / SPATIALREAL_INGRESS_ENDPOINT (the test deployment is
 # https://api.spatialreal.dev and wss://test-driven.spatialreal.dev/v2/driveningress). The SDK
 # appends the routes (/v1/auth/session-token, /websocket).
-DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.com"
+DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.cloud"
 DEFAULT_INGRESS_ENDPOINT = "wss://driven.us-west.spatialreal.cloud/v2/driveningress"
 
 
