@@ -1,6 +1,6 @@
 """Offline lifecycle tests for the SpatialReal avatar plugin.
 
-Runs without network or a LiveKit room: avatarkit and the audio buffer are
+Runs without network or a LiveKit room: the spatialreal SDK session and audio buffer are
 stubbed, and the segment state machine is driven directly.
 
 Usage: .venv/bin/python tests/test_lifecycle.py
@@ -17,9 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from avatarkit.proto.generated import message_pb2  # noqa: E402
 from livekit.agents.voice import io as voice_io  # noqa: E402
 from livekit.agents.voice.avatar import QueueAudioOutput  # noqa: E402
+from spatialreal import PlaybackSignal  # noqa: E402
 
 from livekit import rtc  # noqa: E402
 from livekit.plugins.spatialreal.avatar import AvatarSession  # noqa: E402
@@ -39,6 +39,14 @@ class FakeAvatarkitSession:
 
     async def interrupt(self) -> str:
         self.interrupt_calls += 1
+        return self.req_id
+
+    async def pause(self) -> str:
+        self.pause_calls = getattr(self, "pause_calls", 0) + 1
+        return self.req_id
+
+    async def resume(self) -> str:
+        self.resume_calls = getattr(self, "resume_calls", 0) + 1
         return self.req_id
 
     async def close(self) -> None:
@@ -71,12 +79,8 @@ def make_frame(samples: int = 240, sample_rate: int = 24000) -> rtc.AudioFrame:
     return rtc.AudioFrame.create(sample_rate=sample_rate, num_channels=1, samples_per_channel=samples)
 
 
-def provider_end_frame(req_id: str) -> bytes:
-    envelope = message_pb2.Message()
-    envelope.type = message_pb2.MESSAGE_SERVER_RESPONSE_ANIMATION
-    envelope.server_response_animation.req_id = req_id
-    envelope.server_response_animation.end = True
-    return envelope.SerializeToString()
+def provider_end_signal(req_id: str) -> PlaybackSignal:
+    return PlaybackSignal(req_id=req_id, end=True)
 
 
 async def test_early_provider_completion_is_preserved() -> None:
@@ -84,7 +88,7 @@ async def test_early_provider_completion_is_preserved() -> None:
 
     await session._send_audio_frame(make_frame())
     # provider completion arrives BEFORE the local AudioSegmentEnd
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started"], buffer.events
 
     assert await session._finalize_active_segment(source="segment_end")
@@ -275,15 +279,90 @@ async def test_duplicate_provider_end_ignored() -> None:
 
     await session._send_audio_frame(make_frame())
     assert await session._finalize_active_segment(source="segment_end")
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started", ("finished", False)], buffer.events
 
     # egress ALR retransmission can re-deliver end=true for the same req_id
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
-    session._on_transport_frame(provider_end_frame(fake.req_id), True)
+    session._on_playback_signal(provider_end_signal(fake.req_id))
+    session._on_playback_signal(provider_end_signal(fake.req_id))
     assert buffer.events == ["started", ("finished", False)], buffer.events
     assert not session._early_provider_started_ids and not session._early_provider_completed_ids
     print("PASS duplicate provider end=true events are ignored")
+
+
+async def test_native_pause_defers_duration_completion() -> None:
+    """Regression (live E2E against the spatialreal.dev test backend): on the native
+    server-side path the duration-derived completion ignored the time the server held
+    playback, so the segment finished ~pause-duration before the avatar stopped talking.
+    A native pause must hold completion, and resume must push the expected end back."""
+    import time
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+    assert await session._finalize_active_segment(source="segment_end")
+    segment = session._segments[req]
+    # 10s of audio whose playback started 4s ago
+    segment.attempt_duration = 10.0
+    segment.playback_started = True
+    segment.playback_started_at = time.time() - 4.0
+    before = session._compute_completion_timeout(segment)
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # a completion timer that fires while the server holds playback must not finish the segment
+    await session._wait_for_segment_completion_timeout(req, 0)
+    assert buffer.events == [], buffer.events
+
+    await asyncio.sleep(0.3)  # server holds playback
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # the paused time does not count toward playback: remaining time is unchanged by the pause
+    after = session._compute_completion_timeout(segment)
+    assert after > before - 0.1, (before, after)
+    assert buffer.events == [], buffer.events
+
+    session._complete_segment(req_id=req, interrupted=False, reason="test")
+    print("PASS native pause holds and defers duration-derived completion")
+
+
+async def test_native_resume_without_provider_releases_hold() -> None:
+    """A resume that lands while the provider session is unavailable (reconnect window)
+    must still release the native hold; otherwise the duration fallback never completes
+    the segment and the framework's speech handle is stranded."""
+    import time
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+    assert await session._finalize_active_segment(source="segment_end")
+    segment = session._segments[req]
+    segment.attempt_duration = 10.0
+    segment.playback_started = True
+    segment.playback_started_at = time.time() - 4.0
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert segment.native_paused_at is not None
+
+    session._avatarkit_session = None  # provider reconnect in progress
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert segment.native_paused_at is None
+
+    await session._wait_for_segment_completion_timeout(req, 0)
+    assert buffer.events == [("finished", False)], buffer.events
+    print("PASS native resume during provider reconnect releases the hold")
 
 
 async def main() -> None:
@@ -295,8 +374,132 @@ async def main() -> None:
     await test_active_speaker_secondary_signal()
     await test_audio_tail_attach_and_restore()
     await test_audio_tail_restore_without_wrappers()
+    await test_livekit_egress_token_ttl_outlives_session()
+    await test_native_pause_resume_keeps_audio_flowing()
+    await test_pause_timeout_finalizes_segment_interrupted()
+    await test_non_pause_timeout_playback_state_is_noop()
+    await test_native_pause_defers_duration_completion()
+    await test_native_resume_without_provider_releases_hold()
     print("ALL TESTS PASSED")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+async def test_livekit_egress_token_ttl_outlives_session() -> None:
+    """The egress LiveKit room-join token must outlive a long conversation.
+
+    Regression for the 1h-TTL bug: after the token expired mid-session, an
+    egress rejoin (triggered by a provider-WS reconnect) hit SFU 401 and the
+    avatar dropped out permanently. The token TTL is decoupled from the
+    SpatialReal session TTL and defaults to 24h.
+    """
+    import base64
+    import json
+    from datetime import timedelta
+
+    from livekit.plugins.spatialreal.avatar import DEFAULT_LIVEKIT_TOKEN_TTL
+
+    assert DEFAULT_LIVEKIT_TOKEN_TTL >= timedelta(hours=12)
+
+    session = AvatarSession(api_key="k", app_id="a", avatar_id="av")
+    assert session._livekit_token_ttl == DEFAULT_LIVEKIT_TOKEN_TTL
+
+    # mint a token the same way start() does and decode its exp/nbf claims
+    from livekit import api
+
+    jwt = (
+        api.AccessToken(api_key="devkey", api_secret="secret" * 6)
+        .with_identity("spatialreal-avatar")
+        .with_ttl(session._livekit_token_ttl)
+        .to_jwt()
+    )
+    payload = jwt.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    assert claims["exp"] - claims["nbf"] >= 12 * 3600, claims
+
+    override = AvatarSession(api_key="k", app_id="a", avatar_id="av", livekit_token_ttl_seconds=7200)
+    assert override._livekit_token_ttl == timedelta(seconds=7200)
+    print("PASS egress LiveKit token TTL is long (>=12h default) and configurable")
+
+
+async def test_native_pause_resume_keeps_audio_flowing() -> None:
+    """With server playback_control, pause/resume drive the SDK directly and do
+    NOT interrupt, retain, or divert frames — the segment stays active."""
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    active = session._active_req_id
+    assert active is not None
+
+    session._on_pause()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    # native pause: SDK.pause() called, NOT interrupt; no frame diversion
+    assert getattr(fake, "pause_calls", 0) == 1
+    assert fake.interrupt_calls == 0
+    assert session._pause_requested is False
+    assert session._paused_segment is None
+    assert session._active_req_id == active  # segment untouched
+
+    # audio keeps flowing to the same request while paused
+    await session._send_audio_frame(make_frame())
+    assert session._active_req_id == active
+
+    session._on_resume()
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    assert getattr(fake, "resume_calls", 0) == 1
+    assert buffer.events == []  # never completed; still playing
+
+    session._complete_segment(req_id=active, interrupted=False, reason="test")
+    print("PASS native pause/resume drives SDK without interrupt/retain/divert")
+
+
+async def test_pause_timeout_finalizes_segment_interrupted() -> None:
+    """A server-forced pause_timeout interrupt must finalize the segment so the
+    framework's speech handle isn't stranded."""
+    from spatialreal import InterruptReason, PlaybackState, PlaybackStateEvent
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    req = session._active_req_id
+
+    session._on_playback_state(
+        PlaybackStateEvent(
+            req_id=req, state=PlaybackState.INTERRUPTED, played_ms=1500, reason=InterruptReason.PAUSE_TIMEOUT
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+
+    assert buffer.events and buffer.events[-1] == ("finished", True)
+    assert not session._segments
+    print("PASS pause_timeout finalizes the segment as interrupted")
+
+
+async def test_non_pause_timeout_playback_state_is_noop() -> None:
+    """explicit/preempted interrupts flow through clear_buffer, not this path."""
+    from spatialreal import InterruptReason, PlaybackState, PlaybackStateEvent
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+    await session._send_audio_frame(make_frame())
+
+    session._on_playback_state(
+        PlaybackStateEvent(
+            req_id=session._active_req_id, state=PlaybackState.INTERRUPTED, reason=InterruptReason.EXPLICIT
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.gather(*[t for t in session._background_tasks], return_exceptions=True)
+    # not finalized here — the framework's own clear_buffer owns explicit interrupts
+    assert buffer.events == []
+    session._complete_segment(req_id=session._active_req_id, interrupted=True, reason="test")
+    print("PASS non-pause_timeout playback-state is a no-op on this path")

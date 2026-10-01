@@ -23,9 +23,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from avatarkit import AvatarSession as AvatarkitSession
-from avatarkit import LiveKitEgressConfig, new_avatar_session
-from avatarkit.proto.generated import message_pb2 as _message_pb2
 from livekit.agents import (
     NOT_GIVEN,
     AgentSession,
@@ -39,11 +36,18 @@ from livekit.agents.voice.io import AudioOutput
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import api, rtc
+from spatialreal import AvatarSession as AvatarkitSession
+from spatialreal import (
+    InterruptReason,
+    LiveKitEgressConfig,
+    PlaybackSignal,
+    PlaybackState,
+    PlaybackStateEvent,
+    new_avatar_session,
+)
 
 from .log import logger
 from .resumable_queue_io import ResumableQueueAudioOutput
-
-message_pb2: Any = _message_pb2
 
 __all__ = [
     "AvatarPlaybackStartedEvent",
@@ -69,13 +73,25 @@ AVATAR_AUDIO_ACTIVITY_THRESHOLD = 100
 COMPLETED_REQ_ID_HISTORY = 32
 DEFAULT_RESUME_BUFFER_MAX_SECONDS = 180.0
 DEFAULT_SESSION_TTL = timedelta(hours=1)
+# TTL of the LiveKit room-join token the egress worker uses to (re)join the room.
+# This is NOT the SpatialReal session lifetime — the egress worker keeps re-joining
+# the SFU across the whole session, including after a provider-WS reconnect, so the
+# token must outlive any realistic conversation. When it expires mid-session, egress
+# rejoins with a stale token and the SFU returns 401, which the plugin surfaces as an
+# unrecoverable provider failure and the avatar drops out. Default 24h; override with
+# SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS or the livekit_token_ttl constructor arg.
+DEFAULT_LIVEKIT_TOKEN_TTL = timedelta(hours=24)
 LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
 PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
 
-DEFAULT_CONSOLE_ENDPOINT = "https://console.us-west.spatialwalk.cloud/v1/console"
-DEFAULT_INGRESS_ENDPOINT = "wss://api.us-west.spatialwalk.cloud/v2/driveningress"
+# SpatialReal's production deployment. Override per session with the constructor arguments, or
+# globally with SPATIALREAL_CONSOLE_ENDPOINT / SPATIALREAL_INGRESS_ENDPOINT (the test deployment is
+# https://api.spatialreal.dev and wss://test-driven.spatialreal.dev/v2/driveningress). The SDK
+# appends the routes (/v1/auth/session-token, /websocket).
+DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.cloud"
+DEFAULT_INGRESS_ENDPOINT = "wss://driven.us-west.spatialreal.cloud/v2/driveningress"
 
 
 class SpatialRealException(Exception):
@@ -131,6 +147,8 @@ class _SegmentState:
     attempt_duration: float = 0.0
     input_finalized: bool = False
     provider_events_trusted: bool = True
+    # set while the server holds playback (native pause); time held is not playback
+    native_paused_at: float | None = None
 
 
 class AvatarSession(BaseAvatarSession):
@@ -153,6 +171,7 @@ class AvatarSession(BaseAvatarSession):
         avatar_participant_name: NotGivenOr[str] = NOT_GIVEN,
         idle_timeout_seconds: int = 0,
         sample_rate: NotGivenOr[int] = NOT_GIVEN,
+        livekit_token_ttl_seconds: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         super().__init__()
         resolved_api_key = api_key if utils.is_given(api_key) else os.getenv("SPATIALREAL_API_KEY")
@@ -180,6 +199,15 @@ class AvatarSession(BaseAvatarSession):
             raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
         if utils.is_given(sample_rate) and sample_rate <= 0:
             raise SpatialRealException("sample_rate must be greater than 0")
+
+        resolved_livekit_token_ttl = (
+            int(livekit_token_ttl_seconds)
+            if utils.is_given(livekit_token_ttl_seconds)
+            else self._int_env("SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS", int(DEFAULT_LIVEKIT_TOKEN_TTL.total_seconds()))
+        )
+        if resolved_livekit_token_ttl <= 0:
+            raise SpatialRealException("livekit_token_ttl_seconds must be greater than 0")
+        self._livekit_token_ttl = timedelta(seconds=resolved_livekit_token_ttl)
 
         self._api_key = str(resolved_api_key)
         self._app_id = str(resolved_app_id)
@@ -232,6 +260,7 @@ class AvatarSession(BaseAvatarSession):
         self._close_lock = asyncio.Lock()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
+        self._server_playback_control = False
         self._pause_requested = False
         self._pause_requested_at: float | None = None
         self._discard_requested = False
@@ -309,7 +338,7 @@ class AvatarSession(BaseAvatarSession):
             .with_kind("agent")
             .with_identity(self._avatar_participant_identity)
             .with_name(self._avatar_participant_name)
-            .with_ttl(DEFAULT_SESSION_TTL)
+            .with_ttl(self._livekit_token_ttl)
             .with_attributes(egress_attributes)
             .with_grants(
                 api.VideoGrants(
@@ -488,6 +517,21 @@ class AvatarSession(BaseAvatarSession):
         return type(root_error).__name__
 
     @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("%s=%r is invalid; using %d", name, raw, default)
+            return default
+        if value <= 0:
+            logger.warning("%s=%d must be > 0; using %d", name, value, default)
+            return default
+        return value
+
+    @staticmethod
     def _float_env(name: str, default: float, *, minimum: float) -> float:
         raw = os.getenv(name)
         if raw is None or not raw.strip():
@@ -635,7 +679,8 @@ class AvatarSession(BaseAvatarSession):
             expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
             livekit_egress=self._livekit_egress,
             sample_rate=self._resolved_sample_rate,
-            transport_frames=self._on_transport_frame,
+            on_playback=self._on_playback_signal,
+            on_playback_state=self._on_playback_state,
             on_error=lambda error: self._on_provider_error(generation, error),
             on_close=lambda: self._on_provider_close(generation),
         )
@@ -658,6 +703,11 @@ class AvatarSession(BaseAvatarSession):
             if self._avatarkit_session is provider:
                 self._avatarkit_session = None
             raise
+
+        # When the backend advertises server-side playback control we drive
+        # false-interruption pause/resume natively (no interrupt + re-send).
+        # Feature-detected per connection so a mixed fleet degrades gracefully.
+        self._server_playback_control = "playback_control" in getattr(provider, "capabilities", ())
         return provider
 
     async def _close_provider_session(
@@ -704,6 +754,8 @@ class AvatarSession(BaseAvatarSession):
             "SpatialReal provider websocket closed unexpectedly",
             extra={"generation": generation},
         )
+        # a server-side hold dies with its connection; fall back to duration completion
+        self._release_native_hold()
         self._schedule_provider_recovery(reason="provider_closed")
 
     def _schedule_provider_recovery(self, *, reason: str) -> asyncio.Task[bool] | None:
@@ -1152,6 +1204,10 @@ class AvatarSession(BaseAvatarSession):
         if segment is None:
             return
 
+        # the server is holding playback; resume reschedules against the shifted start
+        if segment.native_paused_at is not None:
+            return
+
         # if the avatar is still audibly speaking, allow a bounded overrun
         # before declaring the segment finished
         if segment.playback_started_at is not None and self._avatar_is_speaking:
@@ -1181,8 +1237,33 @@ class AvatarSession(BaseAvatarSession):
                     extra={"request_id": req_id, "timeout": timeout},
                 )
 
-    def _on_transport_frame(self, frame: bytes, is_last: bool) -> None:
-        req_id = self._extract_req_id_from_transport_frame(frame)
+    def _on_playback_state(self, event: PlaybackStateEvent) -> None:
+        # Structured server-side playback state (egress playback_control). The
+        # PLAYING/PAUSED/ENDED signals are already handled via on_playback
+        # (ServerResponseAnimation); the one thing that path can't express is a
+        # server-forced interrupt of a held pause — surface that here so the
+        # framework's speech handle isn't left hanging on a segment the server
+        # has abandoned.
+        if event.state != PlaybackState.INTERRUPTED:
+            return
+        if event.reason != InterruptReason.PAUSE_TIMEOUT:
+            # explicit / preempted interrupts already flow through the framework's
+            # own clear_buffer path; nothing extra to do.
+            return
+        logger.warning(
+            "SpatialReal avatar pause timed out on the server; finalizing segment as interrupted",
+            extra={"request_id": event.req_id, "played_ms": event.played_ms},
+        )
+        self._discard_requested = True
+        self._pause_requested = False
+        self._spawn_background_task(
+            self._handle_interrupt(),
+            name="spatialreal_avatar_pause_timeout",
+        )
+
+    def _on_playback_signal(self, signal: PlaybackSignal) -> None:
+        req_id = signal.req_id or None
+        is_last = signal.end
         if req_id is not None and req_id in self._recently_completed_req_ids:
             logger.debug(
                 "Ignoring duplicate provider event for completed request",
@@ -1430,20 +1511,6 @@ class AvatarSession(BaseAvatarSession):
                 attempt=0,
             )
 
-    @staticmethod
-    def _extract_req_id_from_transport_frame(frame: bytes) -> str | None:
-        try:
-            envelope = message_pb2.Message()
-            envelope.ParseFromString(frame)
-        except Exception:
-            return None
-
-        if envelope.type != message_pb2.MESSAGE_SERVER_RESPONSE_ANIMATION:
-            return None
-
-        req_id = envelope.server_response_animation.req_id
-        return req_id or None
-
     def _complete_segment(self, *, req_id: str, interrupted: bool, reason: str) -> bool:
         segment = self._segments.pop(req_id, None)
         if segment is None:
@@ -1572,9 +1639,18 @@ class AvatarSession(BaseAvatarSession):
     def _on_pause(self) -> None:
         if self._closing or self._drop_frames_until_segment_end:
             return
+        self._discard_requested = False
+        if self._server_playback_control:
+            # Native path: the server holds its send cursor and keeps ingesting,
+            # so we must NOT set _pause_requested (which diverts/retains frames)
+            # — audio keeps flowing to the same request untouched.
+            self._spawn_background_task(
+                self._handle_pause_native(),
+                name="spatialreal_avatar_pause_native",
+            )
+            return
         self._pause_requested = True
         self._pause_requested_at = time.time()
-        self._discard_requested = False
         self._spawn_background_task(
             self._handle_pause(),
             name="spatialreal_avatar_pause",
@@ -1587,10 +1663,67 @@ class AvatarSession(BaseAvatarSession):
         if self._discard_requested:
             logger.debug("Ignoring SpatialReal avatar resume after confirmed interruption")
             return
+        if self._server_playback_control:
+            self._spawn_background_task(
+                self._handle_resume_native(),
+                name="spatialreal_avatar_resume_native",
+            )
+            return
         self._spawn_background_task(
             self._handle_resume(),
             name="spatialreal_avatar_resume",
         )
+
+    async def _handle_pause_native(self) -> None:
+        """Server-side pause: hold the cursor, keep the segment and audio flow intact."""
+        if not self._avatarkit_session or self._discard_requested:
+            return
+        async with self._provider_io_lock:
+            if self._discard_requested or self._avatarkit_session is None:
+                return
+            try:
+                req_id = await self._avatarkit_session.pause()
+                logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
+            except Exception as e:
+                logger.warning("Failed to pause SpatialReal avatar playback (server-side)", exc_info=e)
+                return
+            segment = self._segments.get(req_id) or self._segments.get(self._active_req_id or "")
+            if segment is not None and segment.native_paused_at is None:
+                segment.native_paused_at = time.time()
+
+    async def _handle_resume_native(self) -> None:
+        """Server-side resume: continue the held cursor from where it stopped."""
+        try:
+            if not self._avatarkit_session or self._discard_requested:
+                return
+            async with self._provider_io_lock:
+                if self._discard_requested or self._avatarkit_session is None:
+                    return
+                try:
+                    req_id = await self._avatarkit_session.resume()
+                    logger.debug("SpatialReal avatar playback resumed (server-side)", extra={"request_id": req_id})
+                except Exception as e:
+                    logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
+        finally:
+            # released on every path (failed resume, resume during a provider
+            # reconnect) so a segment can't be stranded; a hold the server keeps
+            # anyway ends in its pause_timeout interrupt
+            self._release_native_hold()
+
+    def _release_native_hold(self) -> None:
+        """Shift held segments' playback start by the time the server held them."""
+        now = time.time()
+        for segment in self._segments.values():
+            if segment.native_paused_at is None:
+                continue
+            held = now - segment.native_paused_at
+            segment.native_paused_at = None
+            if segment.playback_started_at is not None:
+                segment.playback_started_at += held
+            elif segment.first_frame_at is not None:
+                segment.first_frame_at += held
+            if segment.req_id in self._pending_segment_ids:
+                self._schedule_segment_completion(segment)
 
     def _on_clear_buffer(self) -> None:
         if self._closing:
