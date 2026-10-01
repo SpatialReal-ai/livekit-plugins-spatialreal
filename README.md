@@ -14,7 +14,7 @@ Starting with 1.7.1, the plugin's major and minor version track the `livekit-age
 release it was validated against (e.g. plugin 1.8.x targets `livekit-agents` 1.8.x). The
 patch number is the plugin's own and may advance independently.
 
-The current release, 1.8.3, is validated against `livekit-agents` 1.8.3.
+The current release, 1.8.4, is validated against `livekit-agents` 1.8.4.
 
 Or install from source:
 
