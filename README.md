@@ -14,7 +14,7 @@ Starting with 1.7.1, the plugin's major and minor version track the `livekit-age
 release it was validated against (e.g. plugin 1.8.x targets `livekit-agents` 1.8.x). The
 patch number is the plugin's own and may advance independently.
 
-The current release, 1.8.4, is validated against `livekit-agents` 1.8.4.
+The current release, 1.8.6, is validated against `livekit-agents` 1.8.6.
 
 Or install from source:
 
@@ -33,6 +33,10 @@ SPATIALREAL_APP_ID=your-app-id
 SPATIALREAL_AVATAR_ID=your-avatar-id
 
 # Optional
+# Named SpatialReal deployment; the SDK resolves its endpoints. Defaults to the public one.
+SPATIALREAL_ENVIRONMENT=
+# Explicit endpoints, for a deployment SpatialReal gives you addresses for. They win over
+# SPATIALREAL_ENVIRONMENT.
 SPATIALREAL_CONSOLE_ENDPOINT=
 SPATIALREAL_INGRESS_ENDPOINT=
 # Max seconds of per-response audio retained for false-interruption resume (default 180, min 10)
@@ -108,8 +112,9 @@ Main class for integrating SpatialReal avatars with LiveKit agents.
 | `api_key` | `str` | SpatialReal API key (or set `SPATIALREAL_API_KEY`) |
 | `app_id` | `str` | SpatialReal application ID (or set `SPATIALREAL_APP_ID`) |
 | `avatar_id` | `str` | Avatar ID to use (or set `SPATIALREAL_AVATAR_ID`) |
-| `console_endpoint_url` | `str` | Custom console endpoint URL |
-| `ingress_endpoint_url` | `str` | Custom ingress endpoint URL |
+| `environment` | `str` | Named SpatialReal deployment whose endpoints the SDK resolves (or set `SPATIALREAL_ENVIRONMENT`); defaults to the public deployment |
+| `console_endpoint_url` | `str` | Explicit console endpoint, for a private deployment (or set `SPATIALREAL_CONSOLE_ENDPOINT`) |
+| `ingress_endpoint_url` | `str` | Explicit ingress endpoint, for a private deployment (or set `SPATIALREAL_INGRESS_ENDPOINT`) |
 | `avatar_participant_identity` | `str` | LiveKit identity for avatar participant |
 | `avatar_participant_name` | `str` | LiveKit display name for avatar participant |
 | `idle_timeout_seconds` | `int` | LiveKit egress idle timeout in seconds (`0` uses server defaults) |
