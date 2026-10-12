@@ -36,7 +36,9 @@ from livekit.agents.voice.io import AudioOutput
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import api, rtc
-from spatialreal import AvatarSession as AvatarkitSession
+from spatialreal import (
+    AvatarSession as AvatarkitSession,
+)
 from spatialreal import (
     InterruptReason,
     LiveKitEgressConfig,
@@ -86,12 +88,8 @@ PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
 
-# SpatialReal's production deployment. Override per session with the constructor arguments, or
-# globally with SPATIALREAL_CONSOLE_ENDPOINT / SPATIALREAL_INGRESS_ENDPOINT (the test deployment is
-# https://api.spatialreal.dev and wss://test-driven.spatialreal.dev/v2/driveningress). The SDK
-# appends the routes (/v1/auth/session-token, /websocket).
-DEFAULT_CONSOLE_ENDPOINT = "https://api.spatialreal.cloud"
-DEFAULT_INGRESS_ENDPOINT = "wss://driven.us-west.spatialreal.cloud/v2/driveningress"
+# No endpoint lives here: the SpatialReal SDK resolves them from the deployment it is told to
+# use, so a new region or a moved deployment never needs a new release of this plugin.
 
 
 class SpatialRealException(Exception):
@@ -165,6 +163,7 @@ class AvatarSession(BaseAvatarSession):
         api_key: NotGivenOr[str] = NOT_GIVEN,
         app_id: NotGivenOr[str] = NOT_GIVEN,
         avatar_id: NotGivenOr[str] = NOT_GIVEN,
+        environment: NotGivenOr[str] = NOT_GIVEN,
         console_endpoint_url: NotGivenOr[str] = NOT_GIVEN,
         ingress_endpoint_url: NotGivenOr[str] = NOT_GIVEN,
         avatar_participant_identity: NotGivenOr[str] = NOT_GIVEN,
@@ -203,7 +202,10 @@ class AvatarSession(BaseAvatarSession):
         resolved_livekit_token_ttl = (
             int(livekit_token_ttl_seconds)
             if utils.is_given(livekit_token_ttl_seconds)
-            else self._int_env("SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS", int(DEFAULT_LIVEKIT_TOKEN_TTL.total_seconds()))
+            else self._int_env(
+                "SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS",
+                int(DEFAULT_LIVEKIT_TOKEN_TTL.total_seconds()),
+            )
         )
         if resolved_livekit_token_ttl <= 0:
             raise SpatialRealException("livekit_token_ttl_seconds must be greater than 0")
@@ -212,15 +214,21 @@ class AvatarSession(BaseAvatarSession):
         self._api_key = str(resolved_api_key)
         self._app_id = str(resolved_app_id)
         self._avatar_id = str(resolved_avatar_id)
+        # The SDK owns where a deployment lives: it resolves the endpoints from `environment`
+        # (its own default when unset). The two URLs are overrides for a deployment SpatialReal
+        # hands you an address for; empty means "whatever the environment resolves to".
+        self._environment = str(
+            environment if utils.is_given(environment) else os.getenv("SPATIALREAL_ENVIRONMENT") or ""
+        )
         self._console_endpoint_url = str(
             console_endpoint_url
             if utils.is_given(console_endpoint_url)
-            else os.getenv("SPATIALREAL_CONSOLE_ENDPOINT") or DEFAULT_CONSOLE_ENDPOINT
+            else os.getenv("SPATIALREAL_CONSOLE_ENDPOINT") or ""
         )
         self._ingress_endpoint_url = str(
             ingress_endpoint_url
             if utils.is_given(ingress_endpoint_url)
-            else os.getenv("SPATIALREAL_INGRESS_ENDPOINT") or DEFAULT_INGRESS_ENDPOINT
+            else os.getenv("SPATIALREAL_INGRESS_ENDPOINT") or ""
         )
         self._avatar_participant_identity = str(
             avatar_participant_identity
@@ -309,8 +317,8 @@ class AvatarSession(BaseAvatarSession):
             logger.warning("Avatar session already initialized")
             return
 
-        await super().start(agent_session, room)
-
+        # Validate before super().start(): it registers listeners and a join task, and a
+        # raise after that point would leave them behind with no session to clean them up.
         resolved_livekit_url = livekit_url if utils.is_given(livekit_url) else os.getenv("LIVEKIT_URL")
         resolved_livekit_api_key = livekit_api_key if utils.is_given(livekit_api_key) else os.getenv("LIVEKIT_API_KEY")
         resolved_livekit_api_secret = (
@@ -320,6 +328,8 @@ class AvatarSession(BaseAvatarSession):
             raise SpatialRealException(
                 "livekit_url, livekit_api_key, and livekit_api_secret must be set by arguments or environment variables"
             )
+
+        await super().start(agent_session, room)
 
         room_name = room.name
         local_participant_identity = self._resolve_local_participant_identity(room)
@@ -486,7 +496,7 @@ class AvatarSession(BaseAvatarSession):
             "Check SpatialReal credentials, LiveKit room auth/token configuration, "
             "endpoint URLs, and outbound network access. "
             f"room={room_name}, avatar_id={self._avatar_id}, "
-            f"ingress_endpoint_url={self._ingress_endpoint_url}, "
+            f"ingress_endpoint_url={self._ingress_endpoint_url or '(from environment)'}, "
             f"sample_rate={sample_rate}. Reason: {self._format_error_reason(error)}"
         )
 
@@ -674,8 +684,7 @@ class AvatarSession(BaseAvatarSession):
             api_key=self._api_key,
             app_id=self._app_id,
             avatar_id=self._avatar_id,
-            console_endpoint_url=self._console_endpoint_url,
-            ingress_endpoint_url=self._ingress_endpoint_url,
+            **self._endpoint_options(),
             expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
             livekit_egress=self._livekit_egress,
             sample_rate=self._resolved_sample_rate,
@@ -756,6 +765,10 @@ class AvatarSession(BaseAvatarSession):
         )
         # a server-side hold dies with its connection; fall back to duration completion
         self._release_native_hold()
+        # Audio already handed to the closed connection was never played out. Finish those
+        # segments as interrupted — the same treatment a forwarding error gets — so the
+        # framework is not told later that they played in full.
+        self._complete_all_segments(interrupted=True, reason="provider_closed")
         self._schedule_provider_recovery(reason="provider_closed")
 
     def _schedule_provider_recovery(self, *, reason: str) -> asyncio.Task[bool] | None:
@@ -876,6 +889,17 @@ class AvatarSession(BaseAvatarSession):
                 observed_at=time.time(),
             ),
         )
+
+    def _endpoint_options(self) -> dict[str, str]:
+        """Only what the caller actually set; the SDK resolves the rest from the environment."""
+        options: dict[str, str] = {}
+        if self._environment:
+            options["environment"] = self._environment
+        if self._console_endpoint_url:
+            options["console_endpoint_url"] = self._console_endpoint_url
+        if self._ingress_endpoint_url:
+            options["ingress_endpoint_url"] = self._ingress_endpoint_url
+        return options
 
     async def disconnect_provider_for_test(self) -> None:
         """Close the ingress WebSocket so staging can verify provider recovery."""
@@ -1685,7 +1709,18 @@ class AvatarSession(BaseAvatarSession):
                 req_id = await self._avatarkit_session.pause()
                 logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
             except Exception as e:
-                logger.warning("Failed to pause SpatialReal avatar playback (server-side)", exc_info=e)
+                # Nothing is holding playback: fall back to the emulated path rather than
+                # letting frames keep flowing through the framework's interruption hold.
+                logger.warning(
+                    "Failed to pause SpatialReal avatar playback (server-side); falling back to local pause",
+                    exc_info=e,
+                )
+                self._pause_requested = True
+                self._pause_requested_at = time.time()
+                self._spawn_background_task(
+                    self._handle_pause(),
+                    name="spatialreal_avatar_pause_fallback",
+                )
                 return
             segment = self._segments.get(req_id) or self._segments.get(self._active_req_id or "")
             if segment is not None and segment.native_paused_at is None:
@@ -1701,7 +1736,10 @@ class AvatarSession(BaseAvatarSession):
                     return
                 try:
                     req_id = await self._avatarkit_session.resume()
-                    logger.debug("SpatialReal avatar playback resumed (server-side)", extra={"request_id": req_id})
+                    logger.debug(
+                        "SpatialReal avatar playback resumed (server-side)",
+                        extra={"request_id": req_id},
+                    )
                 except Exception as e:
                     logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
         finally:
@@ -1914,6 +1952,14 @@ class AvatarSession(BaseAvatarSession):
                         interrupted=False,
                         reason="resume_after_playback_complete",
                     )
+                else:
+                    # Everything buffered had already played, so there was nothing to
+                    # resend — but the turn is still open. Put the segment back in play so
+                    # the next frame continues it (or rolls it over) instead of leaving it
+                    # stranded beside a fresh request.
+                    self._segments[segment.req_id] = segment
+                    self._active_req_id = segment.req_id
+                    self._paused_segment = None
                 return
 
             # The provider can reuse request IDs. A delayed completion from the
@@ -2120,6 +2166,15 @@ class AvatarSession(BaseAvatarSession):
                     logger.warning("Error closing SpatialReal avatar session", exc_info=e)
                 finally:
                     self._avatarkit_session = None
+
+            # The base class owns what it registered in start(): removing the avatar
+            # participant from the room, unregistering its listeners and cancelling the
+            # join task. It reads _agent_session and _room, so it has to run before the
+            # fields below are cleared.
+            try:
+                await super().aclose()
+            except Exception as e:
+                logger.warning("Error in base avatar session close", exc_info=e)
 
             self._initialized = False
             self._agent_session = None
