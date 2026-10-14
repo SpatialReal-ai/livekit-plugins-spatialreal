@@ -375,6 +375,7 @@ async def main() -> None:
     await test_audio_tail_attach_and_restore()
     await test_audio_tail_restore_without_wrappers()
     await test_livekit_egress_token_ttl_outlives_session()
+    await test_livekit_egress_token_lets_the_egress_publish_data()
     await test_native_pause_resume_keeps_audio_flowing()
     await test_pause_timeout_finalizes_segment_interrupted()
     await test_non_pause_timeout_playback_state_is_noop()
@@ -423,6 +424,38 @@ async def test_livekit_egress_token_ttl_outlives_session() -> None:
     override = AvatarSession(api_key="k", app_id="a", avatar_id="av", livekit_token_ttl_seconds=7200)
     assert override._livekit_token_ttl == timedelta(seconds=7200)
     print("PASS egress LiveKit token TTL is long (>=12h default) and configurable")
+
+
+async def test_livekit_egress_token_lets_the_egress_publish_data() -> None:
+    """The egress mirrors every animation packet on the reliable data-channel topic
+    `spatialreal-animation` (backend-ng #270) for the iOS / Android SDKs, which cannot
+    read the fake-VP8 track's encoded frames. A token without can_publish_data drops
+    that mirror silently: the video track still flows (Web works) but native avatars
+    never move or speak.
+    """
+    import base64
+    import json
+
+    from livekit import api
+    from livekit.plugins.spatialreal.avatar import _egress_video_grants
+
+    grants = _egress_video_grants("room-1")
+    assert grants.room_join is True and grants.room == "room-1"
+    assert grants.can_publish_data is True
+    assert grants.can_subscribe is False
+
+    jwt = (
+        api.AccessToken(api_key="devkey", api_secret="secret" * 6)
+        .with_identity("spatialreal-avatar")
+        .with_grants(grants)
+        .to_jwt()
+    )
+    payload = jwt.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    video = json.loads(base64.urlsafe_b64decode(payload))["video"]
+    assert video["canPublishData"] is True, video
+    assert video["room"] == "room-1", video
+    print("PASS egress LiveKit token lets the egress publish the data-channel animation mirror")
 
 
 async def test_native_pause_resume_keeps_audio_flowing() -> None:
