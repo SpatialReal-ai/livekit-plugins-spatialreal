@@ -89,11 +89,7 @@ LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
 def _egress_video_grants(room_name: str) -> api.VideoGrants:
     """Grants of the room-join token the SpatialReal egress uses to publish the avatar.
 
-    The egress publishes the avatar's audio and its fake-VP8 animation track, and mirrors
-    every animation packet on the reliable data-channel topic ``spatialreal-animation``
-    for the iOS / Android SDKs, which cannot read the video track's encoded frames. That
-    mirror needs ``can_publish_data``: without it LiveKit drops the packets, the video track
-    still flows (the Web SDK works) and native avatars never move or speak.
+    The egress also publishes data, so the token must allow it.
     """
     return api.VideoGrants(
         room_join=True,
@@ -102,6 +98,8 @@ def _egress_video_grants(room_name: str) -> api.VideoGrants:
         can_publish_data=True,
         can_publish_sources=LIVEKIT_AVATAR_PUBLISH_SOURCES,
     )
+
+
 PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
 PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0

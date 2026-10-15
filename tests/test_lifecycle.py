@@ -427,12 +427,7 @@ async def test_livekit_egress_token_ttl_outlives_session() -> None:
 
 
 async def test_livekit_egress_token_lets_the_egress_publish_data() -> None:
-    """The egress mirrors every animation packet on the reliable data-channel topic
-    `spatialreal-animation` (backend-ng #270) for the iOS / Android SDKs, which cannot
-    read the fake-VP8 track's encoded frames. A token without can_publish_data drops
-    that mirror silently: the video track still flows (Web works) but native avatars
-    never move or speak.
-    """
+    """The egress also publishes data, so its room-join token must allow it."""
     import base64
     import json
 
@@ -455,7 +450,7 @@ async def test_livekit_egress_token_lets_the_egress_publish_data() -> None:
     video = json.loads(base64.urlsafe_b64decode(payload))["video"]
     assert video["canPublishData"] is True, video
     assert video["room"] == "room-1", video
-    print("PASS egress LiveKit token lets the egress publish the data-channel animation mirror")
+    print("PASS egress LiveKit token lets the egress publish data")
 
 
 async def test_native_pause_resume_keeps_audio_flowing() -> None:
