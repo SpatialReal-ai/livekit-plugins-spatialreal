@@ -1713,6 +1713,12 @@ class AvatarSession(BaseAvatarSession):
         async with self._provider_io_lock:
             if self._discard_requested or self._avatarkit_session is None:
                 return
+            if self._current_observable_segment() is None:
+                # Nothing is playing. The provider's last request is one that already
+                # ended (a confirmed interruption the framework has not caught up with),
+                # and holding it would hold nothing.
+                logger.debug("SpatialReal avatar paused with no audio in flight")
+                return
             try:
                 req_id = await self._avatarkit_session.pause()
                 logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
@@ -1741,6 +1747,10 @@ class AvatarSession(BaseAvatarSession):
                 return
             async with self._provider_io_lock:
                 if self._discard_requested or self._avatarkit_session is None:
+                    return
+                if self._current_observable_segment() is None:
+                    # Same as pause: no segment means the request to resume already ended.
+                    logger.debug("SpatialReal avatar resumed with no audio in flight")
                     return
                 try:
                     req_id = await self._avatarkit_session.resume()
