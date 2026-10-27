@@ -377,6 +377,7 @@ async def main() -> None:
     await test_livekit_egress_token_ttl_outlives_session()
     await test_livekit_egress_token_lets_the_egress_publish_data()
     await test_native_pause_resume_keeps_audio_flowing()
+    await test_native_pause_after_confirmed_interruption_leaves_provider_alone()
     await test_pause_timeout_finalizes_segment_interrupted()
     await test_non_pause_timeout_playback_state_is_noop()
     await test_native_pause_defers_duration_completion()
@@ -486,6 +487,38 @@ async def test_native_pause_resume_keeps_audio_flowing() -> None:
 
     session._complete_segment(req_id=active, interrupted=False, reason="test")
     print("PASS native pause/resume drives SDK without interrupt/retain/divert")
+
+
+async def test_native_pause_after_confirmed_interruption_leaves_provider_alone() -> None:
+    """A confirmed interruption ends the segment. When the framework still pauses and
+    resumes that speech afterwards (it can, when its own bookkeeping of the interruption
+    lags), there is no audio in flight to hold: the provider's last request is the
+    interrupted one and must be neither paused nor resumed."""
+
+    async def drain() -> None:
+        await asyncio.sleep(0)
+        await asyncio.gather(*list(session._background_tasks), return_exceptions=True)
+
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    await session._send_audio_frame(make_frame())
+    session._on_pause()  # the user starts talking: hold the playing segment
+    await drain()
+    assert getattr(fake, "pause_calls", 0) == 1
+
+    session._on_clear_buffer()  # confirmed interruption
+    await drain()
+    assert not session._segments and session._active_req_id is None, session._segments
+
+    session._on_pause()
+    await drain()
+    session._on_resume()
+    await drain()
+
+    assert getattr(fake, "pause_calls", 0) == 1, "paused the interrupted request again"
+    assert getattr(fake, "resume_calls", 0) == 0, "resumed the interrupted request"
+    print("PASS native pause/resume after a confirmed interruption leaves the provider alone")
 
 
 async def test_pause_timeout_finalizes_segment_interrupted() -> None:
