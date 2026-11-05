@@ -521,6 +521,74 @@ async def test_native_pause_after_confirmed_interruption_leaves_provider_alone()
     print("PASS native pause/resume after a confirmed interruption leaves the provider alone")
 
 
+async def _drain(session: AvatarSession) -> None:
+    await asyncio.sleep(0)
+    await asyncio.gather(*list(session._background_tasks), return_exceptions=True)
+
+
+async def test_native_pause_before_audio_holds_the_first_frames() -> None:
+    """The user can interrupt while the reply is still in llm/tts. The server has no
+    audio to hold yet, so the first frames are held here and only sent on resume."""
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    session._on_pause()
+    await _drain(session)
+    await session._send_audio_frame(make_frame())
+    await session._send_audio_frame(make_frame())
+    assert fake.sent == [], "frames played during the interruption hold"
+    assert getattr(fake, "pause_calls", 0) == 0
+
+    session._on_resume()
+    await _drain(session)
+    assert len(fake.sent) == 2, fake.sent
+    assert getattr(fake, "resume_calls", 0) == 0, "resumed a request the server never had"
+    assert session._paused_segment is None
+    print("PASS native pause before the first frame holds the frames until resume")
+
+
+async def test_native_pause_before_audio_then_interruption_drops_the_frames() -> None:
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+
+    session._on_pause()
+    await _drain(session)
+    await session._send_audio_frame(make_frame())
+    session._on_clear_buffer()  # confirmed interruption
+    await _drain(session)
+    session._on_resume()
+    await _drain(session)
+
+    assert fake.sent == [], fake.sent
+    assert session._paused_segment is None and not session._segments
+    print("PASS native pause before the first frame, then interruption, sends nothing")
+
+
+async def test_provider_error_finishes_segments_as_interrupted() -> None:
+    """Recovery after a provider error replaces the connection, which loses the audio
+    it was given. Like a close, that speech ends as interrupted and a server-side hold
+    is released, instead of the segment later timing out as fully played."""
+    session, fake, buffer = make_session()
+    session._server_playback_control = True
+    session._provider_session_generation = 1
+    recoveries: list[str] = []
+    session._schedule_provider_recovery = lambda *, reason: recoveries.append(reason)  # type: ignore[method-assign]
+
+    await session._send_audio_frame(make_frame())
+    session._on_pause()
+    await _drain(session)
+    segment = session._segments[session._active_req_id]
+    assert segment.native_paused_at is not None
+
+    session._on_provider_error(1, RuntimeError("boom"))
+
+    assert segment.native_paused_at is None, "native hold was not released"
+    assert not session._segments and session._active_req_id is None
+    assert ("finished", True) in buffer.events, buffer.events
+    assert len(recoveries) == 1
+    print("PASS provider error finishes in-flight segments as interrupted")
+
+
 async def test_pause_timeout_finalizes_segment_interrupted() -> None:
     """A server-forced pause_timeout interrupt must finalize the segment so the
     framework's speech handle isn't stranded."""
@@ -564,3 +632,13 @@ async def test_non_pause_timeout_playback_state_is_noop() -> None:
     assert buffer.events == []
     session._complete_segment(req_id=session._active_req_id, interrupted=True, reason="test")
     print("PASS non-pause_timeout playback-state is a no-op on this path")
+
+
+async def test_session_ttl_outlives_the_call_within_the_server_cap() -> None:
+    """The server closes the SpatialReal session when it expires and rejects an
+    expiry more than 24h out."""
+    from datetime import timedelta
+
+    from livekit.plugins.spatialreal.avatar import DEFAULT_SESSION_TTL
+
+    assert timedelta(hours=12) <= DEFAULT_SESSION_TTL < timedelta(hours=24)
