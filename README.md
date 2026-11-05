@@ -1,6 +1,6 @@
 # LiveKit Agents Plugin for SpatialReal Avatar
 
-This plugin provides integration with [SpatialReal](https://spatialreal.com)'s avatar service for lip-synced avatar rendering in LiveKit voice agents.
+This plugin provides integration with [SpatialReal](https://www.spatialreal.ai/)'s avatar service for lip-synced avatar rendering in LiveKit voice agents.
 
 ## Installation
 
@@ -14,7 +14,7 @@ Starting with 1.7.1, the plugin's major and minor version track the `livekit-age
 release it was validated against (e.g. plugin 1.8.x targets `livekit-agents` 1.8.x). The
 patch number is the plugin's own and may advance independently.
 
-The current release, 1.8.10, is validated against `livekit-agents` 1.8.10.
+The current release, 1.8.11, is validated against `livekit-agents` 1.8.11.
 
 Or install from source:
 
