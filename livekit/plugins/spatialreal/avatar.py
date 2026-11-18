@@ -15,21 +15,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
-from collections import deque
-from collections.abc import Coroutine
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Coroutine
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
-from livekit.agents import (
-    NOT_GIVEN,
-    AgentSession,
-    NotGivenOr,
-    get_job_context,
-    utils,
-)
+from livekit.agents import NOT_GIVEN, AgentSession, NotGivenOr, get_job_context, utils
 from livekit.agents.voice.avatar import AudioSegmentEnd
 from livekit.agents.voice.avatar import AvatarSession as BaseAvatarSession
 from livekit.agents.voice.io import AudioOutput
@@ -37,7 +31,7 @@ from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 
 from livekit import api, rtc
 from spatialreal import (
-    AvatarSession as AvatarkitSession,
+    AvatarSession as SpatialRealSession,
 )
 from spatialreal import (
     InterruptReason,
@@ -61,31 +55,28 @@ __all__ = [
 DEFAULT_AVATAR_PARTICIPANT_IDENTITY = "spatialreal-avatar"
 DEFAULT_AVATAR_PARTICIPANT_NAME = "spatialreal-avatar"
 DEFAULT_SAMPLE_RATE = 24000
-MIN_COMPLETION_TIMEOUT_SECONDS = 3.0
-LIVEKIT_ACTIVITY_COMPLETION_BUFFER_SECONDS = 1.0
-LIVEKIT_ACTIVITY_START_WAIT_SECONDS = 8.0
-LIVEKIT_ACTIVITY_MAX_OVERRUN_SECONDS = 8.0
-LIVEKIT_ACTIVITY_RECHECK_SECONDS = 0.5
-ACTIVE_SEGMENT_IDLE_END_SECONDS = 1.0
-# int16 amplitude (~ -50 dBFS): decoded Opus "silence" is rarely exact zeros,
-# so playback-start detection needs a small energy floor instead of any-nonzero
-AVATAR_AUDIO_ACTIVITY_THRESHOLD = 100
-# egress-mode frame retransmission (ALR) can deliver end=true more than once
-# per req_id; remember recent completions so duplicates are dropped
-COMPLETED_REQ_ID_HISTORY = 32
-DEFAULT_RESUME_BUFFER_MAX_SECONDS = 180.0
 # Lifetime of the SpatialReal session. The server closes the session when it expires,
 # so it has to outlive the call; the server caps it at 24h, less five minutes for clock skew.
 DEFAULT_SESSION_TTL = timedelta(hours=24) - timedelta(minutes=5)
-# TTL of the LiveKit room-join token the egress worker uses to (re)join the room.
-# This is NOT the SpatialReal session lifetime — the egress worker keeps re-joining
-# the SFU across the whole session, including after a provider-WS reconnect, so the
-# token must outlive any realistic conversation. When it expires mid-session, egress
-# rejoins with a stale token and the SFU returns 401, which the plugin surfaces as an
-# unrecoverable provider failure and the avatar drops out. Default 24h; override with
-# SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS or the livekit_token_ttl constructor arg.
+# TTL of the room-join token the SpatialReal egress uses. The egress rejoins the room
+# across the whole session, so the token has to outlive the call too.
 DEFAULT_LIVEKIT_TOKEN_TTL = timedelta(hours=24)
 LIVEKIT_AVATAR_PUBLISH_SOURCES = ["camera", "microphone"]
+# server capability: it can hold playback (pause/resume) while it keeps ingesting audio
+PLAYBACK_CONTROL_CAPABILITY = "playback_control"
+
+PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
+PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
+PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
+
+# The server reports when a reply has played out. If that report never comes, the reply
+# is finished locally once it should have played, plus this margin.
+COMPLETION_MARGIN_SECONDS = 3.0
+# allowance for a reply that hasn't started playing yet (inference and egress latency)
+START_ALLOWANCE_SECONDS = 5.0
+
+# No endpoint lives here: the SpatialReal SDK resolves them from the deployment it is told to
+# use, so a new region or a moved deployment never needs a new release of this plugin.
 
 
 def _egress_video_grants(room_name: str) -> api.VideoGrants:
@@ -102,25 +93,13 @@ def _egress_video_grants(room_name: str) -> api.VideoGrants:
     )
 
 
-PROVIDER_RECONNECT_DELAYS_SECONDS = (0.0, 0.5, 1.0)
-PROVIDER_CONNECT_TIMEOUT_SECONDS = 15.0
-PROVIDER_CLOSE_TIMEOUT_SECONDS = 5.0
-
-# No endpoint lives here: the SpatialReal SDK resolves them from the deployment it is told to
-# use, so a new region or a moved deployment never needs a new release of this plugin.
-
-
 class SpatialRealException(Exception):
     """Exception raised for SpatialReal avatar integration errors."""
 
 
-class _ProviderClearDuringSend(RuntimeError):
-    """LiveKit cleared playback while a provider send was queued or active."""
-
-
 @dataclass(frozen=True)
 class AvatarPlaybackStartedEvent:
-    """Observed playback start for one SpatialReal request."""
+    """The avatar started playing one reply."""
 
     request_id: str
     source: str
@@ -129,7 +108,7 @@ class AvatarPlaybackStartedEvent:
 
 @dataclass(frozen=True)
 class AvatarProviderConnectionEvent:
-    """Provider connection state emitted without including conversation content."""
+    """State of the connection to SpatialReal (no conversation content)."""
 
     state: Literal["connected", "recovering", "recovered", "failed"]
     reason: str
@@ -138,33 +117,36 @@ class AvatarProviderConnectionEvent:
     observed_at: float
 
 
-@dataclass
-class _BufferedAudioFrame:
-    audio: bytes
-    duration: float
-    sample_rate: int
-    num_channels: int
+@dataclass(eq=False)
+class _Reply:
+    """One framework playout segment, sent to SpatialReal as one request."""
 
+    req_id: str | None = None
+    pushed: float = 0.0
+    input_done: bool = False
+    started_at: float | None = None
+    # time the server held playback (paused); it isn't played time
+    held: float = 0.0
+    finished: bool = False
+    completion_task: asyncio.Task[None] | None = None
 
-@dataclass
-class _SegmentState:
-    req_id: str
-    pushed_duration: float = 0.0
-    first_frame_at: float | None = None
-    playback_started: bool = False
-    playback_started_at: float | None = None
-    playback_start_source: str | None = None
-    provider_playback_completed: bool = False
-    completion_timeout_task: asyncio.Task[None] | None = None
-    audio_frames: deque[_BufferedAudioFrame] = field(default_factory=deque)
-    buffered_duration: float = 0.0
-    buffer_start_position: float = 0.0
-    playback_position_offset: float = 0.0
-    attempt_duration: float = 0.0
-    input_finalized: bool = False
-    provider_events_trusted: bool = True
-    # set while the server holds playback (native pause); time held is not playback
-    native_paused_at: float | None = None
+    def _held(self, now: float, hold_started_at: float | None) -> float:
+        assert self.started_at is not None
+        held = self.held
+        if hold_started_at is not None:
+            held += max(0.0, now - max(hold_started_at, self.started_at))
+        return held
+
+    def played(self, now: float, hold_started_at: float | None) -> float:
+        if self.started_at is None:
+            return 0.0
+        played = now - self.started_at - self._held(now, hold_started_at)
+        return min(self.pushed, max(0.0, played))
+
+    def expected_end(self, now: float, hold_started_at: float | None) -> float:
+        """When the reply finishes playing, given the pauses so far."""
+        assert self.started_at is not None
+        return self.started_at + self._held(now, hold_started_at) + self.pushed
 
 
 class AvatarSession(BaseAvatarSession):
@@ -191,33 +173,16 @@ class AvatarSession(BaseAvatarSession):
         livekit_token_ttl_seconds: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         super().__init__()
-        resolved_api_key = api_key if utils.is_given(api_key) else os.getenv("SPATIALREAL_API_KEY")
-        if not resolved_api_key:
-            raise SpatialRealException(
-                "api_key must be set either by passing it to AvatarSession or "
-                "by setting the SPATIALREAL_API_KEY environment variable"
-            )
-
-        resolved_app_id = app_id if utils.is_given(app_id) else os.getenv("SPATIALREAL_APP_ID")
-        if not resolved_app_id:
-            raise SpatialRealException(
-                "app_id must be set either by passing it to AvatarSession or "
-                "by setting the SPATIALREAL_APP_ID environment variable"
-            )
-
-        resolved_avatar_id = avatar_id if utils.is_given(avatar_id) else os.getenv("SPATIALREAL_AVATAR_ID")
-        if not resolved_avatar_id:
-            raise SpatialRealException(
-                "avatar_id must be set either by passing it to AvatarSession or "
-                "by setting the SPATIALREAL_AVATAR_ID environment variable"
-            )
+        self._api_key = self._required(api_key, "api_key", "SPATIALREAL_API_KEY")
+        self._app_id = self._required(app_id, "app_id", "SPATIALREAL_APP_ID")
+        self._avatar_id = self._required(avatar_id, "avatar_id", "SPATIALREAL_AVATAR_ID")
 
         if idle_timeout_seconds < 0:
             raise SpatialRealException("idle_timeout_seconds must be greater than or equal to 0")
         if utils.is_given(sample_rate) and sample_rate <= 0:
             raise SpatialRealException("sample_rate must be greater than 0")
 
-        resolved_livekit_token_ttl = (
+        token_ttl = (
             int(livekit_token_ttl_seconds)
             if utils.is_given(livekit_token_ttl_seconds)
             else self._int_env(
@@ -225,29 +190,16 @@ class AvatarSession(BaseAvatarSession):
                 int(DEFAULT_LIVEKIT_TOKEN_TTL.total_seconds()),
             )
         )
-        if resolved_livekit_token_ttl <= 0:
+        if token_ttl <= 0:
             raise SpatialRealException("livekit_token_ttl_seconds must be greater than 0")
-        self._livekit_token_ttl = timedelta(seconds=resolved_livekit_token_ttl)
+        self._livekit_token_ttl = timedelta(seconds=token_ttl)
 
-        self._api_key = str(resolved_api_key)
-        self._app_id = str(resolved_app_id)
-        self._avatar_id = str(resolved_avatar_id)
         # The SDK owns where a deployment lives: it resolves the endpoints from `environment`
         # (its own default when unset). The two URLs are overrides for a deployment SpatialReal
         # hands you an address for; empty means "whatever the environment resolves to".
-        self._environment = str(
-            environment if utils.is_given(environment) else os.getenv("SPATIALREAL_ENVIRONMENT") or ""
-        )
-        self._console_endpoint_url = str(
-            console_endpoint_url
-            if utils.is_given(console_endpoint_url)
-            else os.getenv("SPATIALREAL_CONSOLE_ENDPOINT") or ""
-        )
-        self._ingress_endpoint_url = str(
-            ingress_endpoint_url
-            if utils.is_given(ingress_endpoint_url)
-            else os.getenv("SPATIALREAL_INGRESS_ENDPOINT") or ""
-        )
+        self._environment = self._optional(environment, "SPATIALREAL_ENVIRONMENT")
+        self._console_endpoint_url = self._optional(console_endpoint_url, "SPATIALREAL_CONSOLE_ENDPOINT")
+        self._ingress_endpoint_url = self._optional(ingress_endpoint_url, "SPATIALREAL_INGRESS_ENDPOINT")
         self._avatar_participant_identity = str(
             avatar_participant_identity
             if utils.is_given(avatar_participant_identity)
@@ -259,59 +211,43 @@ class AvatarSession(BaseAvatarSession):
         self._idle_timeout_seconds = idle_timeout_seconds
         self._sample_rate = sample_rate if utils.is_given(sample_rate) else None
 
-        self._avatarkit_session: AvatarkitSession | None = None
         self._agent_session: AgentSession | None = None
         self._room: rtc.Room | None = None
         self._audio_buffer: ResumableQueueAudioOutput | None = None
-        self._original_audio_output: Any | None = None
+        self._original_audio_output: AudioOutput | None = None
         self._original_audio_tail: AudioOutput | None = None
-        self._audio_output_attached = False
-        self._main_task: asyncio.Task | None = None
-        self._initialized = False
-        self._segments: dict[str, _SegmentState] = {}
-        self._pending_segment_ids: deque[str] = deque()
-        self._early_provider_started_ids: set[str] = set()
-        self._early_provider_completed_ids: set[str] = set()
-        self._recently_completed_req_ids: deque[str] = deque(maxlen=COMPLETED_REQ_ID_HISTORY)
-        self._active_req_id: str | None = None
-        self._represented_participant_identity: str | None = None
-        self._avatar_is_speaking = False
-        self._avatar_audio_stream: rtc.AudioStream | None = None
-        self._avatar_audio_monitor_task: asyncio.Task[None] | None = None
-        self._active_segment_idle_end_task: asyncio.Task[None] | None = None
-        self._segment_finalize_lock = asyncio.Lock()
-        self._interrupt_lock = asyncio.Lock()
-        self._provider_io_lock = asyncio.Lock()
-        self._provider_reconnect_lock = asyncio.Lock()
-        self._close_lock = asyncio.Lock()
-        self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._closing = False
-        self._server_playback_control = False
-        self._pause_requested = False
-        self._pause_requested_at: float | None = None
-        self._discard_requested = False
-        self._paused_segment: _SegmentState | None = None
-        self._drop_frames_until_segment_end = False
-        self._provider_send_in_flight = False
-        self._clear_during_provider_send = False
-        self._clear_generation = 0
-        self._provider_recovery_in_flight = False
-        self._clear_during_provider_recovery = False
-        self._provider_reconnect_task: asyncio.Task[bool] | None = None
-        self._provider_connection_state = "disconnected"
-        self._provider_generation = 0
-        self._provider_session_generation = 0
-        self._provider_expected_close_generations: set[int] = set()
-        self._provider_recovery_pending_playback = False
-        self._provider_terminal_failure = False
         self._livekit_egress: LiveKitEgressConfig | None = None
         self._resolved_sample_rate: int | None = None
-        self._local_segment_sequence = 0
-        self._resume_buffer_max_seconds = self._float_env(
-            "SPATIALREAL_RESUME_BUFFER_MAX_SECONDS",
-            DEFAULT_RESUME_BUFFER_MAX_SECONDS,
-            minimum=10.0,
-        )
+        self._main_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._initialized = False
+        self._closing = False
+        self._close_lock = asyncio.Lock()
+
+        # provider connection
+        self._provider: SpatialRealSession | None = None
+        self._generation = 0
+        self._expected_close_generations: set[int] = set()
+        self._reconnect_task: asyncio.Task[bool] | None = None
+        self._recovery_exhausted = False
+        self._playback_control = False
+        # serializes everything sent to the provider, so an interrupt can't overtake
+        # the audio it is meant to stop (or the reverse)
+        self._io_lock = asyncio.Lock()
+
+        # replies: the one being fed (`_input`) and every one not yet played out
+        self._input: _Reply | None = None
+        self._replies: list[_Reply] = []
+        self._drop_until_segment_end = False
+        # bumped on every clear: audio taken from the queue before it is stale
+        self._clear_generation = 0
+        self._interrupt_pending = False
+        # a send has the request open on the server before its id comes back
+        self._send_in_flight = False
+        # pause: what the framework asked for, and whether the server holds playback
+        self._paused = False
+        self._server_holding = False
+        self._hold_started_at: float | None = None
 
     @property
     def avatar_identity(self) -> str:
@@ -320,6 +256,8 @@ class AvatarSession(BaseAvatarSession):
     @property
     def provider(self) -> str:
         return "spatialreal"
+
+    # --- lifecycle ----------------------------------------------------------------------
 
     async def start(
         self,
@@ -337,12 +275,10 @@ class AvatarSession(BaseAvatarSession):
 
         # Validate before super().start(): it registers listeners and a join task, and a
         # raise after that point would leave them behind with no session to clean them up.
-        resolved_livekit_url = livekit_url if utils.is_given(livekit_url) else os.getenv("LIVEKIT_URL")
-        resolved_livekit_api_key = livekit_api_key if utils.is_given(livekit_api_key) else os.getenv("LIVEKIT_API_KEY")
-        resolved_livekit_api_secret = (
-            livekit_api_secret if utils.is_given(livekit_api_secret) else os.getenv("LIVEKIT_API_SECRET")
-        )
-        if not resolved_livekit_url or not resolved_livekit_api_key or not resolved_livekit_api_secret:
+        url = str(livekit_url if utils.is_given(livekit_url) else os.getenv("LIVEKIT_URL", ""))
+        key = str(livekit_api_key if utils.is_given(livekit_api_key) else os.getenv("LIVEKIT_API_KEY", ""))
+        secret = str(livekit_api_secret if utils.is_given(livekit_api_secret) else os.getenv("LIVEKIT_API_SECRET", ""))
+        if not url or not key or not secret:
             raise SpatialRealException(
                 "livekit_url, livekit_api_key, and livekit_api_secret must be set by arguments or environment variables"
             )
@@ -350,19 +286,9 @@ class AvatarSession(BaseAvatarSession):
         await super().start(agent_session, room)
 
         room_name = room.name
-        local_participant_identity = self._resolve_local_participant_identity(room)
-        self._represented_participant_identity = local_participant_identity
-        logger.debug(
-            "starting SpatialReal avatar session",
-            extra={"room": room_name},
-        )
-
-        egress_attributes = {ATTRIBUTE_PUBLISH_ON_BEHALF: local_participant_identity}
+        egress_attributes = {ATTRIBUTE_PUBLISH_ON_BEHALF: self._resolve_local_participant_identity(room)}
         livekit_token = (
-            api.AccessToken(
-                api_key=str(resolved_livekit_api_key),
-                api_secret=str(resolved_livekit_api_secret),
-            )
+            api.AccessToken(api_key=key, api_secret=secret)
             .with_kind("agent")
             .with_identity(self._avatar_participant_identity)
             .with_name(self._avatar_participant_name)
@@ -371,114 +297,49 @@ class AvatarSession(BaseAvatarSession):
             .with_grants(_egress_video_grants(room_name))
             .to_jwt()
         )
-
-        livekit_egress = LiveKitEgressConfig(
-            url=str(resolved_livekit_url),
+        self._livekit_egress = LiveKitEgressConfig(
+            url=url,
             api_token=livekit_token,
             room_name=room_name,
             publisher_id=self._avatar_participant_identity,
             extra_attributes=egress_attributes,
             idle_timeout=self._idle_timeout_seconds,
         )
-
-        resolved_sample_rate = self._sample_rate
-        if resolved_sample_rate is None:
-            resolved_sample_rate = agent_session.tts.sample_rate if agent_session.tts else DEFAULT_SAMPLE_RATE
-        if resolved_sample_rate <= 0:
-            raise SpatialRealException("sample_rate must be greater than 0")
-
+        sample_rate = self._sample_rate or (agent_session.tts.sample_rate if agent_session.tts else DEFAULT_SAMPLE_RATE)
+        self._resolved_sample_rate = sample_rate
         self._agent_session = agent_session
         self._room = room
-        self._livekit_egress = livekit_egress
-        self._resolved_sample_rate = resolved_sample_rate
         self._original_audio_output = agent_session.output.audio
         self._original_audio_tail = self._resolve_audio_tail(agent_session.output.audio)
+        logger.debug("starting SpatialReal avatar session", extra={"room": room_name})
 
         try:
-            last_provider_error: Exception | None = None
-            for attempt, delay in enumerate(PROVIDER_RECONNECT_DELAYS_SECONDS, start=1):
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                try:
-                    async with self._provider_io_lock:
-                        await self._connect_fresh_provider_session()
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    last_provider_error = error
-                    logger.warning(
-                        "SpatialReal provider startup attempt failed",
-                        exc_info=error,
-                        extra={"attempt": attempt},
-                    )
-            else:
-                assert last_provider_error is not None
-                raise last_provider_error
+            attempt = await self._connect_with_retries()
+            self._emit_connection_state("connected", reason="initial_start", attempt=attempt)
 
-            self._provider_connection_state = "connected"
-            self._emit_provider_connection_state(
-                state="connected",
-                reason="initial_start",
-                attempt=attempt,
-            )
-
-            # wait_playback_start defers the framework's playback_started event
-            # (transcript sync, first-frame metrics) until we observe the avatar
-            # actually playing in the room, instead of firing when the first TTS
-            # frame is merely handed to SpatialReal.
+            # wait_playback_start: the framework's playback_started (transcript sync,
+            # first-frame metrics) fires when the server reports the avatar playing,
+            # not when the first frame is handed over.
             self._audio_buffer = ResumableQueueAudioOutput(
-                sample_rate=resolved_sample_rate,
+                sample_rate=sample_rate,
                 wait_playback_start=True,
+                can_pause=self._playback_control,
             )
             await self._audio_buffer.start()
             self._audio_buffer.on("clear_buffer", self._on_clear_buffer)  # type: ignore[arg-type]
             self._audio_buffer.on("pause", self._on_pause)  # type: ignore[arg-type]
             self._audio_buffer.on("resume", self._on_resume)  # type: ignore[arg-type]
 
-            # Until the SpatialReal egress backend emits request-correlated
-            # playback lifecycle events, playback start is observed client-side
-            # from the avatar's published LiveKit audio track (primary) and the
-            # room's active-speaker state (secondary).
-            room.on("active_speakers_changed", self._on_active_speakers_changed)
-            room.on("track_published", self._on_track_published)
-            room.on("track_subscribed", self._on_track_subscribed)
-            room.on("track_unsubscribed", self._on_track_unsubscribed)
-
-            for participant in room.remote_participants.values():
-                if not self._is_avatar_output_participant(participant):
-                    continue
-                for publication in participant.track_publications.values():
-                    if publication.kind != rtc.TrackKind.KIND_AUDIO:
-                        continue
-                    publication.set_subscribed(True)
-                    if publication.track is not None:
-                        self._start_avatar_audio_monitor(publication.track)
-
-            # keep output wrappers (TranscriptSynchronizer, recorder, ...) in
-            # the chain: swap only the tail sink
+            # keep output wrappers (TranscriptSynchronizer, recorder, ...) in the chain
             agent_session.output.replace_audio_tail(self._audio_buffer)
-            self._audio_output_attached = True
-            self._main_task = asyncio.create_task(
-                self._run_main_task(),
-                name="spatialreal_avatar_audio_forwarder",
-            )
+            self._main_task = asyncio.create_task(self._forward_audio(), name="spatialreal_avatar_audio_forwarder")
             self._initialized = True
 
-            # Interruption is owned entirely by the framework. ``pause`` holds
-            # a candidate interruption, ``resume`` restores a rejected one,
-            # and ``clear_buffer`` confirms a true interruption. We do NOT
-            # interrupt on ``user_state_changed`` -> "speaking" — that fires on
-            # raw VAD, upstream of every framework gate, so coughs, throat
-            # clears and single-word fragments would truncate the avatar even
-            # when turn handling would not treat them as a real interruption.
-            # This matches the framework's reference receiver
-            # (livekit/agents/voice/avatar/_runner.py:_on_clear_buffer); none of
-            # the official avatar plugins listen to user_state_changed.
-
+            # Interruption is owned by the framework: pause holds a candidate
+            # interruption, resume restores a rejected one, clear_buffer confirms one.
             @agent_session.on("close")
             def _on_session_close(_: Any) -> None:
-                self._spawn_background_task(self.aclose(), name="spatialreal_avatar_session_close")
+                self._spawn(self.aclose(), name="spatialreal_avatar_session_close")
 
         except asyncio.CancelledError:
             await self.aclose()
@@ -487,28 +348,618 @@ class AvatarSession(BaseAvatarSession):
             logger.debug("SpatialReal avatar session startup failed", exc_info=True)
             await self.aclose()
             raise SpatialRealException(
-                self._build_start_error_message(
-                    error=e,
-                    room_name=room_name,
-                    sample_rate=resolved_sample_rate,
-                )
+                "Failed to start SpatialReal avatar session. Check SpatialReal credentials, "
+                "LiveKit room auth/token configuration, endpoint URLs, and outbound network "
+                f"access. room={room_name}, avatar_id={self._avatar_id}, "
+                f"ingress_endpoint_url={self._ingress_endpoint_url or '(from environment)'}, "
+                f"sample_rate={sample_rate}. Reason: {self._format_error_reason(e)}"
             ) from None
 
-    def _build_start_error_message(
-        self,
-        *,
-        error: Exception,
-        room_name: str,
-        sample_rate: int,
-    ) -> str:
-        return (
-            "Failed to start SpatialReal avatar session. "
-            "Check SpatialReal credentials, LiveKit room auth/token configuration, "
-            "endpoint URLs, and outbound network access. "
-            f"room={room_name}, avatar_id={self._avatar_id}, "
-            f"ingress_endpoint_url={self._ingress_endpoint_url or '(from environment)'}, "
-            f"sample_rate={sample_rate}. Reason: {self._format_error_reason(error)}"
+    async def aclose(self) -> None:
+        async with self._close_lock:
+            if self._closing:
+                return
+            self._closing = True
+
+            current = asyncio.current_task()
+            tasks = [t for t in self._background_tasks if t is not current and not t.done()]
+            if self._main_task is not None:
+                tasks.append(self._main_task)
+                self._main_task = None
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            self._finish_all(reason="session_close")
+            self._detach_audio_output()
+            if self._audio_buffer is not None:
+                await self._audio_buffer.aclose()
+                self._audio_buffer = None
+
+            provider, self._provider = self._provider, None
+            if provider is not None:
+                try:
+                    await provider.close()
+                    logger.debug("SpatialReal avatar session closed")
+                except Exception as e:
+                    logger.warning("Error closing SpatialReal avatar session", exc_info=e)
+
+            # The base class removes the avatar participant from the room and unregisters
+            # what it registered in start(). It reads _agent_session and _room, so it runs
+            # before they are cleared.
+            try:
+                await super().aclose()
+            except Exception as e:
+                logger.warning("Error in base avatar session close", exc_info=e)
+
+            self._initialized = False
+            self._room = None
+            self._agent_session = None
+            self._original_audio_output = None
+            self._original_audio_tail = None
+
+    def _detach_audio_output(self) -> None:
+        if self._agent_session is None or self._audio_buffer is None:
+            return
+        output = self._agent_session.output
+        if output.audio is self._audio_buffer:
+            # no wrappers were present, so the whole chain was replaced
+            output.audio = self._original_audio_output
+        elif self._resolve_audio_tail(output.audio) is self._audio_buffer and self._original_audio_tail is not None:
+            output.replace_audio_tail(self._original_audio_tail)
+
+    async def disconnect_provider_for_test(self) -> None:
+        """Close the ingress WebSocket so a test can exercise provider recovery."""
+        if self._closing or self._provider is None:
+            raise SpatialRealException("SpatialReal provider session is unavailable")
+        await self._provider.close()
+
+    # --- provider connection ------------------------------------------------------------
+
+    async def _connect(self) -> None:
+        if self._livekit_egress is None or self._resolved_sample_rate is None:
+            raise SpatialRealException("SpatialReal provider configuration is unavailable")
+        self._generation += 1
+        generation = self._generation
+        provider = new_avatar_session(
+            api_key=self._api_key,
+            app_id=self._app_id,
+            avatar_id=self._avatar_id,
+            **self._endpoint_options(),
+            expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
+            livekit_egress=self._livekit_egress,
+            sample_rate=self._resolved_sample_rate,
+            on_playback=lambda signal: self._on_playback_signal(signal, generation),
+            on_playback_state=lambda event: self._on_playback_state(event, generation),
+            on_error=lambda error: self._on_provider_lost(generation, "provider_error", error),
+            on_close=lambda: self._on_provider_lost(generation, "provider_closed"),
         )
+
+        async def _start() -> None:
+            await provider.init()
+            await provider.start()
+
+        try:
+            await asyncio.wait_for(_start(), timeout=PROVIDER_CONNECT_TIMEOUT_SECONDS)
+        except BaseException:
+            await self._close_quietly(provider, generation)
+            raise
+        self._playback_control = PLAYBACK_CONTROL_CAPABILITY in provider.capabilities
+        self._provider = provider
+
+    async def _connect_with_retries(self) -> int:
+        last_error: Exception | None = None
+        for attempt, delay in enumerate(PROVIDER_RECONNECT_DELAYS_SECONDS, start=1):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if self._closing:
+                raise SpatialRealException("SpatialReal avatar session is closing")
+            try:
+                await self._connect()
+                return attempt
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                last_error = error
+                logger.warning(
+                    "SpatialReal provider connect attempt failed",
+                    exc_info=error,
+                    extra={"attempt": attempt},
+                )
+        assert last_error is not None
+        raise last_error
+
+    async def _close_quietly(self, provider: SpatialRealSession, generation: int) -> None:
+        self._expected_close_generations.add(generation)
+        try:
+            await asyncio.wait_for(provider.close(), timeout=PROVIDER_CLOSE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning("SpatialReal provider close did not complete cleanly", exc_info=error)
+        finally:
+            self._expected_close_generations.discard(generation)
+
+    def _on_provider_lost(self, generation: int, reason: str, error: Exception | None = None) -> None:
+        if (
+            self._closing
+            or generation != self._generation
+            or generation in self._expected_close_generations
+            or self._provider is None  # already being replaced
+        ):
+            return
+        logger.warning(
+            "SpatialReal provider connection lost",
+            exc_info=error,
+            extra={"generation": generation, "reason": reason},
+        )
+        # whatever the lost connection was playing won't play: finish it, and drop the
+        # rest of a reply that is still being fed
+        self._finish_all(reason=reason, drop_rest=True)
+        provider, self._provider = self._provider, None
+        if self._reconnect_task is None or self._reconnect_task.done():
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect(provider, generation, reason),
+                name="spatialreal_provider_reconnect",
+            )
+            self._background_tasks.add(self._reconnect_task)
+            self._reconnect_task.add_done_callback(self._background_tasks.discard)
+
+    async def _reconnect(self, lost: SpatialRealSession | None, generation: int, reason: str) -> bool:
+        self._emit_connection_state("recovering", reason=reason, attempt=0)
+        if lost is not None:
+            await self._close_quietly(lost, generation)
+        try:
+            attempt = await self._connect_with_retries()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self._closing:
+                return False
+            self._recovery_exhausted = True
+            logger.error(
+                "SpatialReal provider recovery exhausted; the avatar stays silent",
+                extra={"reason": f"{reason}:{self._format_error_reason(error)}"},
+            )
+            self._emit_connection_state("failed", reason=reason, attempt=0)
+            return False
+        logger.info("SpatialReal provider reconnected", extra={"attempt": attempt})
+        self._emit_connection_state("recovered", reason=reason, attempt=attempt)
+        return True
+
+    async def _ready_provider(self) -> SpatialRealSession:
+        """The live provider, waiting out a reconnect in flight."""
+        task = self._reconnect_task
+        if self._provider is None and task is not None and not task.done():
+            await asyncio.shield(task)
+        if self._provider is None:
+            raise SpatialRealException("SpatialReal provider is unavailable")
+        return self._provider
+
+    def _emit_connection_state(
+        self,
+        state: Literal["connected", "recovering", "recovered", "failed"],
+        *,
+        reason: str,
+        attempt: int,
+    ) -> None:
+        self.emit(
+            "provider_connection_state_changed",
+            AvatarProviderConnectionEvent(
+                state=state,
+                reason=reason,
+                attempt=attempt,
+                generation=self._generation,
+                observed_at=time.time(),
+            ),
+        )
+
+    # --- audio forwarding ---------------------------------------------------------------
+
+    async def _forward_audio(self) -> None:
+        assert self._audio_buffer is not None
+        async for item in self._audio_buffer:
+            clear_generation = self._clear_generation
+            try:
+                if isinstance(item, AudioSegmentEnd):
+                    await self._end_input(clear_generation)
+                else:
+                    await self._send_frame(item, clear_generation)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._input_failed(item, error, clear_generation)
+
+    @contextlib.asynccontextmanager
+    async def _provider_io(self) -> AsyncIterator[SpatialRealSession]:
+        """The live provider, held exclusively; waits out a reconnect in flight.
+
+        A provider that fails while in use is reported as lost, under its own generation,
+        so a stale reference can never tear down its replacement.
+        """
+        while True:
+            provider = await self._ready_provider()
+            generation = self._generation
+            async with self._io_lock:
+                if provider is not self._provider:
+                    continue  # replaced while waiting for the lock
+                await self._send_pending_interrupt(provider)
+                try:
+                    yield provider
+                except Exception as error:
+                    self._on_provider_lost(generation, "forwarding_error", error)
+                    raise
+                return
+
+    async def _send_frame(self, frame: rtc.AudioFrame, clear_generation: int) -> None:
+        if self._drop_until_segment_end:
+            return
+        if self._input is None:
+            # the framework counts the reply from its first frame, so it gets a record
+            # (and a finish) even if sending it fails
+            self._input = _Reply()
+            self._replies.append(self._input)
+        reply = self._input
+        async with self._provider_io() as provider:
+            if clear_generation != self._clear_generation or reply.finished:
+                return
+            self._send_in_flight = True
+            try:
+                reply.req_id = await provider.send_audio(bytes(frame.data), end=False)
+            finally:
+                self._send_in_flight = False
+            reply.pushed += frame.duration
+            if self._paused and not self._server_holding and self._playback_control:
+                # paused before this reply reached the server: hold it from the start
+                await self._hold(provider)
+
+    async def _end_input(self, clear_generation: int) -> None:
+        if self._drop_until_segment_end:
+            self._drop_until_segment_end = False
+            return
+        reply, self._input = self._input, None
+        if reply is None or reply.finished:
+            return
+        if reply.req_id is None:
+            self._finish(reply, interrupted=True, reason="no_audio_sent")
+            return
+        try:
+            async with self._provider_io() as provider:
+                if clear_generation != self._clear_generation or reply.finished:
+                    return
+                await provider.send_audio(b"", end=True)
+                reply.input_done = True
+        except Exception:
+            self._finish(reply, interrupted=True, reason="forwarding_error")
+            raise
+        self._arm_completion_fallback(reply)
+
+    def _input_failed(self, item: rtc.AudioFrame | AudioSegmentEnd, error: Exception, clear_generation: int) -> None:
+        if self._recovery_exhausted:
+            logger.warning("SpatialReal provider is unavailable; finishing the reply")
+        else:
+            logger.error("SpatialReal provider audio forwarding failed", exc_info=error)
+        if clear_generation != self._clear_generation:
+            return  # the reply was interrupted meanwhile, and the clear finished it
+        reply, self._input = self._input, None
+        if reply is None:
+            return  # already finished (a lost connection or a pause timeout drops its rest)
+        self._finish(reply, interrupted=True, reason="forwarding_error")
+        # the end marker of this reply is still to come: drop what is left of it
+        self._drop_until_segment_end = isinstance(item, rtc.AudioFrame)
+
+    async def _send_pending_interrupt(self, provider: SpatialRealSession) -> None:
+        if not self._interrupt_pending:
+            return
+        self._interrupt_pending = False
+        try:
+            await provider.interrupt()
+        except Exception as e:
+            logger.warning("Failed to interrupt SpatialReal avatar", exc_info=e)
+
+    # --- framework events ---------------------------------------------------------------
+
+    def _on_clear_buffer(self) -> None:
+        """A confirmed interruption: finish what is playing and stop the server."""
+        if self._closing:
+            return
+        self._clear_generation += 1
+        self._paused = False
+        # LiveKit flushes before clearing, and the clear can drain the queued segment end,
+        # so the clear is itself the boundary of the interrupted reply
+        self._drop_until_segment_end = False
+        sent = self._send_in_flight or any(r.req_id is not None for r in self._replies)
+        self._finish_all(reason="interrupt")
+        self._finish_drained_segments()
+        if not sent:
+            return
+        self._interrupt_pending = True
+        self._spawn(self._interrupt(), name="spatialreal_avatar_interrupt")
+
+    def _finish_drained_segments(self) -> None:
+        """Finish segments the clear drained from the queue before any frame was read.
+
+        The framework counts a segment when it captures the first frame, so one cleared
+        before it reached us has no record here, but still needs its finish.
+        """
+        buffer = self._audio_buffer
+        if buffer is None:
+            return
+        for _ in range(buffer._pending_playback_count):
+            buffer.notify_playback_started()
+            buffer.notify_playback_finished(playback_position=0.0, interrupted=True)
+
+    async def _interrupt(self) -> None:
+        async with self._io_lock:
+            provider = self._provider
+            if provider is None:
+                self._interrupt_pending = False  # a replacement connection has nothing to stop
+                return
+            await self._send_pending_interrupt(provider)
+        logger.debug("SpatialReal avatar interrupted")
+
+    def _on_pause(self) -> None:
+        if self._closing:
+            return
+        self._paused = True
+        self._spawn(self._apply_pause(), name="spatialreal_avatar_pause")
+
+    def _on_resume(self) -> None:
+        if self._closing:
+            return
+        self._paused = False
+        self._spawn(self._apply_resume(), name="spatialreal_avatar_resume")
+
+    async def _apply_pause(self) -> None:
+        async with self._io_lock:
+            provider = self._provider
+            if provider is None:
+                return
+            await self._send_pending_interrupt(provider)
+            in_flight = any(r.req_id is not None for r in self._replies)
+            # with nothing sent yet the reply is held as soon as its first frame goes out
+            if self._paused and not self._server_holding and in_flight:
+                await self._hold(provider)
+
+    async def _apply_resume(self) -> None:
+        async with self._io_lock:
+            provider = self._provider
+            if provider is None or self._paused or not self._server_holding:
+                return
+            try:
+                await provider.resume()
+            except Exception as e:
+                logger.warning("Failed to resume SpatialReal avatar playback", exc_info=e)
+            self._release_hold()
+            logger.debug(
+                "SpatialReal avatar playback resumed (server-side)",
+                extra={"request_id": self._latest_req_id()},
+            )
+
+    async def _hold(self, provider: SpatialRealSession) -> None:
+        try:
+            await provider.pause()
+        except Exception as e:
+            logger.warning("Failed to pause SpatialReal avatar playback", exc_info=e)
+            return
+        self._server_holding = True
+        self._hold_started_at = time.time()
+        logger.debug(
+            "SpatialReal avatar playback paused (server-side)",
+            extra={"request_id": self._latest_req_id()},
+        )
+
+    def _release_hold(self) -> None:
+        if self._hold_started_at is not None:
+            now = time.time()
+            for reply in self._replies:
+                if reply.started_at is not None:
+                    reply.held += now - max(self._hold_started_at, reply.started_at)
+        self._server_holding = False
+        self._hold_started_at = None
+
+    # --- server events ------------------------------------------------------------------
+
+    def _latest_req_id(self) -> str | None:
+        return next((r.req_id for r in reversed(self._replies) if r.req_id), None)
+
+    def _reply_for(self, req_id: str) -> _Reply | None:
+        if not req_id:
+            return None
+        return next((r for r in self._replies if r.req_id == req_id), None)
+
+    def _on_playback_signal(self, signal: PlaybackSignal, generation: int) -> None:
+        if generation != self._generation:
+            return
+        # an unknown request already finished (the egress can repeat end=true) or
+        # belongs to a reply that was interrupted
+        reply = self._reply_for(signal.req_id)
+        if reply is None:
+            return
+        self._mark_started(reply, source="spatialreal_transport_frame")
+        if signal.end:
+            self._finish(reply, interrupted=False, reason="provider_end")
+
+    def _on_playback_state(self, event: PlaybackStateEvent, generation: int) -> None:
+        # PLAYING/PAUSED/ENDED arrive through the playback signal; the one thing it can't
+        # express is the server giving up on a held pause
+        if (
+            generation != self._generation
+            or event.state != PlaybackState.INTERRUPTED
+            or event.reason != InterruptReason.PAUSE_TIMEOUT
+        ):
+            return
+        reply = self._reply_for(event.req_id)
+        if reply is None:
+            return
+        logger.warning(
+            "SpatialReal avatar pause timed out on the server; finishing the reply",
+            extra={"request_id": event.req_id, "played_ms": event.played_ms},
+        )
+        self._paused = False
+        self._release_hold()
+        if reply is self._input:
+            self._input = None
+            self._drop_until_segment_end = True
+            # the server dropped the request, but the SDK still has it open: close it, or
+            # the next reply would be sent under the abandoned request id
+            self._interrupt_pending = True
+            self._spawn(self._interrupt(), name="spatialreal_avatar_pause_timeout")
+        self._finish(reply, interrupted=True, reason="pause_timeout")
+
+    # --- reply bookkeeping --------------------------------------------------------------
+
+    def _mark_started(self, reply: _Reply, *, source: str) -> None:
+        if reply.started_at is not None:
+            return
+        reply.started_at = time.time()
+        if self._audio_buffer is not None:
+            self._audio_buffer.notify_playback_started()
+        logger.debug(
+            "SpatialReal avatar playback started",
+            extra={"request_id": reply.req_id, "source": source},
+        )
+        self.emit(
+            "playback_started",
+            AvatarPlaybackStartedEvent(
+                request_id=reply.req_id or "",
+                source=source,
+                observed_at=reply.started_at,
+            ),
+        )
+        if reply.input_done:
+            # the fallback deadline now counts from the real start
+            self._arm_completion_fallback(reply)
+
+    def _finish(self, reply: _Reply, *, interrupted: bool, reason: str) -> None:
+        """Tell the framework one reply is done. Each reply is finished exactly once."""
+        if reply.finished:
+            return
+        reply.finished = True
+        # before the hold is released below: time still held is not played time
+        if interrupted:
+            position = reply.played(time.time(), self._hold_started_at)
+        else:
+            position = reply.pushed
+        if reply in self._replies:
+            self._replies.remove(reply)
+        if self._input is reply:
+            self._input = None
+        task = reply.completion_task
+        reply.completion_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if not self._replies:
+            self._release_hold()
+
+        logger.debug(
+            "SpatialReal avatar segment playback completed",
+            extra={
+                "request_id": reply.req_id,
+                "reason": reason,
+                "interrupted": interrupted,
+                "playback_position": round(position, 3),
+                "pushed_duration": round(reply.pushed, 3),
+            },
+        )
+        if self._audio_buffer is None:
+            return
+        if reply.started_at is None:
+            # the framework expects playback_started before playback_finished
+            self._audio_buffer.notify_playback_started()
+        self._audio_buffer.notify_playback_finished(playback_position=position, interrupted=interrupted)
+
+    def _finish_all(self, *, reason: str, drop_rest: bool = False) -> None:
+        if drop_rest and self._input is not None:
+            self._drop_until_segment_end = True
+        for reply in list(self._replies):
+            self._finish(reply, interrupted=True, reason=reason)
+        self._release_hold()
+
+    def _arm_completion_fallback(self, reply: _Reply) -> None:
+        if reply.completion_task is not None:
+            reply.completion_task.cancel()
+        reply.completion_task = self._spawn(
+            self._completion_fallback(reply), name="spatialreal_avatar_completion_fallback"
+        )
+
+    async def _completion_fallback(self, reply: _Reply) -> None:
+        armed_at = time.time()
+        while not reply.finished:
+            now = time.time()
+            if reply.started_at is None:
+                deadline = armed_at + reply.pushed + START_ALLOWANCE_SECONDS
+            else:
+                # when the reply should have played out; a pause moves it later, so it
+                # is worked out again on every wake-up
+                deadline = reply.expected_end(now, self._hold_started_at)
+            deadline += COMPLETION_MARGIN_SECONDS
+            if now < deadline:
+                await asyncio.sleep(deadline - now)
+                continue
+            if self._server_holding:
+                # time held by a pause isn't playback: wait it out
+                await asyncio.sleep(COMPLETION_MARGIN_SECONDS)
+                continue
+            logger.warning(
+                "SpatialReal reported no end of playback; finishing the reply",
+                extra={"request_id": reply.req_id},
+            )
+            self._finish(reply, interrupted=False, reason="completion_fallback")
+
+    # --- helpers ------------------------------------------------------------------------
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any], *, name: str) -> asyncio.Task[Any] | None:
+        if self._closing:
+            coro.close()
+            return None
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _endpoint_options(self) -> dict[str, str]:
+        options = {
+            "environment": self._environment,
+            "console_endpoint_url": self._console_endpoint_url,
+            "ingress_endpoint_url": self._ingress_endpoint_url,
+        }
+        return {key: value for key, value in options.items() if value}
+
+    @staticmethod
+    def _required(value: NotGivenOr[str], name: str, env: str) -> str:
+        resolved = value if utils.is_given(value) else os.getenv(env)
+        if not resolved:
+            raise SpatialRealException(
+                f"{name} must be set either by passing it to AvatarSession or by setting the {env} environment variable"
+            )
+        return str(resolved)
+
+    @staticmethod
+    def _optional(value: NotGivenOr[str], env: str) -> str:
+        return str(value if utils.is_given(value) else os.getenv(env) or "")
+
+    @staticmethod
+    def _int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning("%s=%r is invalid; using %d", name, raw, default)
+            return default
+        if value <= 0:
+            logger.warning("%s=%d must be > 0; using %d", name, value, default)
+            return default
+        return value
+
+    @staticmethod
+    def _resolve_audio_tail(sink: AudioOutput | None) -> AudioOutput | None:
+        while sink is not None and sink.next_in_chain is not None:
+            sink = sink.next_in_chain
+        return sink
 
     @staticmethod
     def _resolve_local_participant_identity(room: rtc.Room) -> str:
@@ -521,1694 +972,13 @@ class AvatarSession(BaseAvatarSession):
 
     @staticmethod
     def _format_error_reason(error: BaseException) -> str:
-        root_error = error
-        seen_errors: set[int] = set()
-
-        while id(root_error) not in seen_errors:
-            seen_errors.add(id(root_error))
-            next_error = root_error.__cause__ or (None if root_error.__suppress_context__ else root_error.__context__)
-            if next_error is None:
+        root: BaseException = error
+        seen: set[int] = set()
+        while id(root) not in seen:
+            seen.add(id(root))
+            cause = root.__cause__ or (None if root.__suppress_context__ else root.__context__)
+            if cause is None:
                 break
-            root_error = next_error
-
-        message = str(root_error) or str(error)
-        if message:
-            return f"{type(root_error).__name__}: {message}"
-        return type(root_error).__name__
-
-    @staticmethod
-    def _int_env(name: str, default: int) -> int:
-        raw = os.getenv(name)
-        if raw is None or not raw.strip():
-            return default
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            logger.warning("%s=%r is invalid; using %d", name, raw, default)
-            return default
-        if value <= 0:
-            logger.warning("%s=%d must be > 0; using %d", name, value, default)
-            return default
-        return value
-
-    @staticmethod
-    def _float_env(name: str, default: float, *, minimum: float) -> float:
-        raw = os.getenv(name)
-        if raw is None or not raw.strip():
-            return default
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            logger.warning("%s=%r is invalid; using %.2f", name, raw, default)
-            return default
-        if value < minimum:
-            logger.warning(
-                "%s=%.2f is below minimum %.2f; using %.2f",
-                name,
-                value,
-                minimum,
-                default,
-            )
-            return default
-        return value
-
-    def _spawn_background_task(
-        self,
-        coro: Coroutine[Any, Any, Any],
-        *,
-        name: str,
-    ) -> asyncio.Task[Any] | None:
-        if self._closing:
-            coro.close()
-            return None
-        task = asyncio.create_task(coro, name=name)
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
-
-    @staticmethod
-    def _resolve_audio_tail(sink: AudioOutput | None) -> AudioOutput | None:
-        while sink is not None and sink.next_in_chain is not None:
-            sink = sink.next_in_chain
-        return sink
-
-    async def _run_main_task(self) -> None:
-        if not self._audio_buffer or not self._avatarkit_session:
-            return
-
-        try:
-            async for item in self._audio_buffer:
-                try:
-                    if self._drop_frames_until_segment_end:
-                        if isinstance(item, AudioSegmentEnd):
-                            self._drop_frames_until_segment_end = False
-                        continue
-                    if isinstance(item, rtc.AudioFrame):
-                        await self._send_audio_frame(item)
-                    elif isinstance(item, AudioSegmentEnd):
-                        if not await self._finalize_active_segment(source="segment_end"):
-                            logger.debug("Avatar segment end received without an active request")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    await self._recover_provider_forwarding_error(item=item, error=e)
-        except asyncio.CancelledError:
-            logger.debug("SpatialReal avatar audio forwarder cancelled")
-        except Exception as e:
-            logger.error("Error in SpatialReal avatar audio forwarder", exc_info=e)
-
-    async def _recover_provider_forwarding_error(
-        self,
-        *,
-        item: rtc.AudioFrame | AudioSegmentEnd,
-        error: Exception,
-    ) -> None:
-        """Release the current framework playout and keep forwarding later turns."""
-        logger.error(
-            "SpatialReal provider audio forwarding failed; abandoning affected segment",
-            exc_info=error,
-        )
-        clear_before_recovery = self._clear_during_provider_send
-        self._clear_during_provider_send = False
-        self._provider_recovery_in_flight = True
-        self._clear_during_provider_recovery = False
-        try:
-            async with self._provider_io_lock:
-                if not self._avatarkit_session:
-                    return
-
-                try:
-                    await self._avatarkit_session.interrupt()
-                except Exception:
-                    logger.warning(
-                        "Failed to stop SpatialReal provider after audio forwarding error",
-                        exc_info=True,
-                    )
-
-                if isinstance(item, rtc.AudioFrame) and not self._segments and self._paused_segment is None:
-                    local_segment = self._new_local_segment()
-                    self._segments[local_segment.req_id] = local_segment
-                    self._append_audio_frame(
-                        local_segment,
-                        _BufferedAudioFrame(
-                            audio=bytes(item.data),
-                            duration=item.duration,
-                            sample_rate=item.sample_rate,
-                            num_channels=item.num_channels,
-                        ),
-                        sent_to_provider=False,
-                    )
-
-                self._cancel_active_segment_idle_end()
-                self._complete_all_segments(
-                    interrupted=True,
-                    reason="provider_forwarding_error",
-                )
-                self._drop_frames_until_segment_end = (
-                    isinstance(item, rtc.AudioFrame)
-                    and not clear_before_recovery
-                    and not self._clear_during_provider_recovery
-                )
-                self._active_req_id = None
-                self._paused_segment = None
-                self._pause_requested = False
-                self._pause_requested_at = None
-                self._discard_requested = False
-        finally:
-            self._provider_recovery_in_flight = False
-            self._clear_during_provider_recovery = False
-
-        recovered = await self._ensure_provider_connection(
-            reason=f"audio_forwarding_error:{self._format_error_reason(error)}"
-        )
-        if not recovered:
-            self._drop_frames_until_segment_end = True
-
-    def _create_provider_session(self) -> AvatarkitSession:
-        if self._livekit_egress is None or self._resolved_sample_rate is None:
-            raise SpatialRealException("SpatialReal provider configuration is unavailable")
-
-        self._provider_generation += 1
-        generation = self._provider_generation
-        provider = new_avatar_session(
-            api_key=self._api_key,
-            app_id=self._app_id,
-            avatar_id=self._avatar_id,
-            **self._endpoint_options(),
-            expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
-            livekit_egress=self._livekit_egress,
-            sample_rate=self._resolved_sample_rate,
-            on_playback=self._on_playback_signal,
-            on_playback_state=self._on_playback_state,
-            on_error=lambda error: self._on_provider_error(generation, error),
-            on_close=lambda: self._on_provider_close(generation),
-        )
-        self._provider_session_generation = generation
-        return provider
-
-    async def _connect_fresh_provider_session(self) -> AvatarkitSession:
-        provider = self._create_provider_session()
-        generation = self._provider_session_generation
-        self._avatarkit_session = provider
-
-        async def _start() -> None:
-            await provider.init()
-            await provider.start()
-
-        try:
-            await asyncio.wait_for(_start(), timeout=PROVIDER_CONNECT_TIMEOUT_SECONDS)
-        except BaseException:
-            await self._close_provider_session(provider, generation=generation)
-            if self._avatarkit_session is provider:
-                self._avatarkit_session = None
-            raise
-
-        # When the backend advertises server-side playback control we drive
-        # false-interruption pause/resume natively (no interrupt + re-send).
-        # Feature-detected per connection so a mixed fleet degrades gracefully.
-        self._server_playback_control = "playback_control" in getattr(provider, "capabilities", ())
-        return provider
-
-    async def _close_provider_session(
-        self,
-        provider: AvatarkitSession,
-        *,
-        generation: int,
-    ) -> None:
-        self._provider_expected_close_generations.add(generation)
-        try:
-            await asyncio.wait_for(
-                provider.close(),
-                timeout=PROVIDER_CLOSE_TIMEOUT_SECONDS,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            logger.warning(
-                "SpatialReal provider close did not complete cleanly",
-                exc_info=error,
-                extra={"generation": generation},
-            )
-        finally:
-            self._provider_expected_close_generations.discard(generation)
-
-    def _on_provider_error(self, generation: int, error: Exception) -> None:
-        if generation != self._provider_session_generation or self._closing:
-            return
-        logger.error(
-            "SpatialReal provider websocket reported an error",
-            exc_info=error,
-            extra={"generation": generation},
-        )
-        # recovery replaces the connection, so this audio is lost the same way as on a close
-        self._abandon_provider_playback(reason="provider_error")
-        self._schedule_provider_recovery(reason=f"provider_error:{self._format_error_reason(error)}")
-
-    def _on_provider_close(self, generation: int) -> None:
-        if (
-            generation in self._provider_expected_close_generations
-            or generation != self._provider_session_generation
-            or self._closing
-        ):
-            return
-        logger.warning(
-            "SpatialReal provider websocket closed unexpectedly",
-            extra={"generation": generation},
-        )
-        self._abandon_provider_playback(reason="provider_closed")
-        self._schedule_provider_recovery(reason="provider_closed")
-
-    def _abandon_provider_playback(self, *, reason: str) -> None:
-        # a server-side hold dies with its connection; fall back to duration completion
-        self._release_native_hold()
-        # Audio already handed to the lost connection was never played out. Finish those
-        # segments as interrupted — the same treatment a forwarding error gets — so the
-        # framework is not told later that they played in full.
-        self._complete_all_segments(interrupted=True, reason=reason)
-
-    def _schedule_provider_recovery(self, *, reason: str) -> asyncio.Task[bool] | None:
-        if self._closing:
-            return None
-        task = self._provider_reconnect_task
-        if task is not None and not task.done():
-            return task
-        task = asyncio.create_task(
-            self._recover_provider_connection(reason=reason),
-            name="spatialreal_provider_reconnect",
-        )
-        self._provider_reconnect_task = task
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return task
-
-    async def _ensure_provider_connection(self, *, reason: str) -> bool:
-        task = self._schedule_provider_recovery(reason=reason)
-        if task is None:
-            return False
-        return await asyncio.shield(task)
-
-    async def _recover_provider_connection(self, *, reason: str) -> bool:
-        async with self._provider_reconnect_lock:
-            if self._closing:
-                return False
-            if self._provider_terminal_failure:
-                return False
-
-            self._provider_connection_state = "recovering"
-            self._provider_recovery_pending_playback = False
-            self._emit_provider_connection_state(
-                state="recovering",
-                reason=reason,
-                attempt=0,
-            )
-
-            last_error: Exception | None = None
-            for attempt, delay in enumerate(PROVIDER_RECONNECT_DELAYS_SECONDS, start=1):
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                if self._closing:
-                    return False
-
-                try:
-                    async with self._provider_io_lock:
-                        provider = self._avatarkit_session
-                        if provider is not None:
-                            generation = self._provider_session_generation
-                            await self._close_provider_session(
-                                provider,
-                                generation=generation,
-                            )
-                            if self._avatarkit_session is provider:
-                                self._avatarkit_session = None
-
-                        # Always create a fresh AvatarKit session. Reusing the
-                        # closed object also reuses its private request state,
-                        # which can correlate a new WebSocket with the failed
-                        # request from the old connection.
-                        await self._connect_fresh_provider_session()
-
-                    self._provider_connection_state = "connected"
-                    self._provider_recovery_pending_playback = True
-                    logger.info(
-                        "SpatialReal provider websocket reconnected; awaiting observed avatar playback",
-                        extra={
-                            "attempt": attempt,
-                            "generation": self._provider_session_generation,
-                            "reason": reason,
-                        },
-                    )
-                    self._emit_provider_connection_state(
-                        state="connected",
-                        reason="reconnected_awaiting_playback",
-                        attempt=attempt,
-                    )
-                    return True
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
-                    last_error = error
-                    logger.warning(
-                        "SpatialReal provider reconnect attempt failed",
-                        exc_info=error,
-                        extra={"attempt": attempt, "reason": reason},
-                    )
-
-            self._provider_terminal_failure = True
-            self._provider_connection_state = "failed"
-            failure_reason = f"{reason}:{self._format_error_reason(last_error)}" if last_error is not None else reason
-            logger.error(
-                "SpatialReal provider recovery exhausted; full room restart required",
-                extra={"reason": failure_reason},
-            )
-            self._emit_provider_connection_state(
-                state="failed",
-                reason=failure_reason,
-                attempt=len(PROVIDER_RECONNECT_DELAYS_SECONDS),
-            )
-            return False
-
-    def _emit_provider_connection_state(
-        self,
-        *,
-        state: Literal["connected", "recovering", "recovered", "failed"],
-        reason: str,
-        attempt: int,
-    ) -> None:
-        self.emit(
-            "provider_connection_state_changed",
-            AvatarProviderConnectionEvent(
-                state=state,
-                reason=reason,
-                attempt=attempt,
-                generation=self._provider_session_generation,
-                observed_at=time.time(),
-            ),
-        )
-
-    def _endpoint_options(self) -> dict[str, str]:
-        """Only what the caller actually set; the SDK resolves the rest from the environment."""
-        options: dict[str, str] = {}
-        if self._environment:
-            options["environment"] = self._environment
-        if self._console_endpoint_url:
-            options["console_endpoint_url"] = self._console_endpoint_url
-        if self._ingress_endpoint_url:
-            options["ingress_endpoint_url"] = self._ingress_endpoint_url
-        return options
-
-    async def disconnect_provider_for_test(self) -> None:
-        """Close the ingress WebSocket so staging can verify provider recovery."""
-        if self._closing or self._avatarkit_session is None:
-            raise SpatialRealException("SpatialReal provider session is unavailable")
-        await self._avatarkit_session.close()
-
-    async def _send_audio_frame(self, frame: rtc.AudioFrame) -> None:
-        if self._provider_terminal_failure:
-            raise SpatialRealException("SpatialReal provider recovery is exhausted")
-        if not self._avatarkit_session:
-            return
-
-        buffered_frame = _BufferedAudioFrame(
-            audio=bytes(frame.data),
-            duration=frame.duration,
-            sample_rate=frame.sample_rate,
-            num_channels=frame.num_channels,
-        )
-
-        clear_generation = self._clear_generation
-        async with self._provider_io_lock:
-            if clear_generation != self._clear_generation:
-                return
-            if self._discard_requested and not self._segments and self._paused_segment is None:
-                self._discard_requested = False
-
-            if self._pause_requested:
-                segment = self._paused_segment
-                if segment is None:
-                    segment = self._new_local_segment()
-                    self._paused_segment = segment
-                self._append_audio_frame(segment, buffered_frame, sent_to_provider=False)
-                return
-
-            previous_req_id = self._active_req_id
-            req_id = await self._send_provider_audio(
-                audio=buffered_frame.audio,
-                end=False,
-                clear_generation=clear_generation,
-            )
-            provider_events_trusted = not self._reactivate_request_id(req_id)
-            if previous_req_id and previous_req_id != req_id:
-                logger.warning(
-                    "Avatar request ID changed while streaming audio",
-                    extra={"previous": previous_req_id, "current": req_id},
-                )
-                previous_segment = self._segments.get(previous_req_id)
-                if previous_segment is not None:
-                    self._mark_segment_waiting_for_completion(previous_segment)
-
-            segment = self._segments.get(req_id)
-            if segment is None:
-                segment = _SegmentState(
-                    req_id=req_id,
-                    provider_events_trusted=provider_events_trusted,
-                )
-                self._segments[req_id] = segment
-            else:
-                segment.provider_events_trusted = segment.provider_events_trusted and provider_events_trusted
-
-            if not segment.provider_events_trusted:
-                logger.warning(
-                    "SpatialReal reused a request ID; provider lifecycle events are disabled for active attempt",
-                    extra={"request_id": req_id},
-                )
-
-            self._consume_early_provider_events(segment)
-
-            if segment.first_frame_at is None:
-                segment.first_frame_at = time.time()
-                logger.debug("SpatialReal avatar first audio frame", extra={"request_id": req_id})
-
-            self._append_audio_frame(segment, buffered_frame, sent_to_provider=True)
-            self._active_req_id = req_id
-            self._schedule_active_segment_idle_end()
-
-    async def _send_provider_audio(
-        self,
-        *,
-        audio: bytes,
-        end: bool,
-        clear_generation: int,
-    ) -> str:
-        """Send provider audio only while its LiveKit clear generation is current."""
-        if not self._avatarkit_session:
-            raise RuntimeError("SpatialReal provider session is unavailable")
-        if clear_generation != self._clear_generation:
-            raise _ProviderClearDuringSend("LiveKit cleared playback before provider send")
-
-        self._provider_send_in_flight = True
-        self._clear_during_provider_send = False
-        try:
-            req_id = await self._avatarkit_session.send_audio(audio=audio, end=end)
-        finally:
-            self._provider_send_in_flight = False
-
-        if self._clear_during_provider_send or clear_generation != self._clear_generation:
-            raise _ProviderClearDuringSend("LiveKit cleared playback during provider send")
-        return req_id
-
-    def _append_audio_frame(
-        self,
-        segment: _SegmentState,
-        frame: _BufferedAudioFrame,
-        *,
-        sent_to_provider: bool,
-    ) -> None:
-        segment.audio_frames.append(frame)
-        segment.buffered_duration += frame.duration
-        segment.pushed_duration += frame.duration
-        if sent_to_provider:
-            segment.attempt_duration += frame.duration
-
-        while segment.buffered_duration > self._resume_buffer_max_seconds and len(segment.audio_frames) > 1:
-            dropped = segment.audio_frames.popleft()
-            segment.buffered_duration -= dropped.duration
-            segment.buffer_start_position += dropped.duration
-
-    @staticmethod
-    def _remaining_audio_frames(
-        segment: _SegmentState,
-        playback_position: float,
-    ) -> list[_BufferedAudioFrame]:
-        remaining: list[_BufferedAudioFrame] = []
-        skip = max(0.0, playback_position - segment.buffer_start_position)
-
-        for frame in segment.audio_frames:
-            if skip >= frame.duration:
-                skip -= frame.duration
-                continue
-
-            if skip <= 0.0:
-                remaining.append(frame)
-                continue
-
-            bytes_per_sample = max(1, frame.num_channels) * 2
-            samples_to_skip = min(
-                int(round(skip * frame.sample_rate)),
-                len(frame.audio) // bytes_per_sample,
-            )
-            byte_offset = samples_to_skip * bytes_per_sample
-            audio = frame.audio[byte_offset:]
-            duration = len(audio) / (bytes_per_sample * frame.sample_rate)
-            if audio and duration > 0.0:
-                remaining.append(
-                    _BufferedAudioFrame(
-                        audio=audio,
-                        duration=duration,
-                        sample_rate=frame.sample_rate,
-                        num_channels=frame.num_channels,
-                    )
-                )
-            skip = 0.0
-
-        return remaining
-
-    def _consume_early_provider_events(self, segment: _SegmentState) -> None:
-        if not segment.provider_events_trusted:
-            self._early_provider_started_ids.discard(segment.req_id)
-            self._early_provider_completed_ids.discard(segment.req_id)
-            return
-        if segment.req_id in self._early_provider_started_ids:
-            self._early_provider_started_ids.discard(segment.req_id)
-            self._mark_playback_started(segment, source="spatialreal_transport_frame")
-        if segment.req_id in self._early_provider_completed_ids:
-            self._early_provider_completed_ids.discard(segment.req_id)
-            segment.provider_playback_completed = True
-
-    def _cancel_active_segment_idle_end(self) -> None:
-        if self._active_segment_idle_end_task and not self._active_segment_idle_end_task.done():
-            self._active_segment_idle_end_task.cancel()
-        self._active_segment_idle_end_task = None
-
-    def _schedule_active_segment_idle_end(self) -> None:
-        active_req_id = self._active_req_id
-        if active_req_id is None:
-            return
-
-        self._cancel_active_segment_idle_end()
-        self._active_segment_idle_end_task = asyncio.create_task(
-            self._wait_for_active_segment_idle_end(active_req_id, ACTIVE_SEGMENT_IDLE_END_SECONDS),
-            name=f"spatialreal_idle_segment_end_{active_req_id}",
-        )
-
-    async def _wait_for_active_segment_idle_end(self, req_id: str, timeout: float) -> None:
-        try:
-            await asyncio.sleep(timeout)
-        except asyncio.CancelledError:
-            return
-
-        if self._active_req_id != req_id:
-            return
-        if req_id in self._pending_segment_ids:
-            return
-        if req_id not in self._segments:
-            return
-        try:
-            finalized = await self._finalize_active_segment(source="idle_timeout")
-        except Exception as error:
-            await self._recover_provider_forwarding_error(
-                item=AudioSegmentEnd(),
-                error=error,
-            )
-            return
-
-        if finalized:
-            logger.warning(
-                "Avatar segment end marker missing; forcing finalization",
-                extra={"request_id": req_id, "idle_timeout": timeout},
-            )
-
-    async def _finalize_active_segment(self, *, source: str) -> bool:
-        if not self._avatarkit_session:
-            return False
-
-        clear_generation = self._clear_generation
-        async with self._provider_io_lock:
-            if clear_generation != self._clear_generation:
-                return False
-            if self._pause_requested:
-                if self._paused_segment is None:
-                    self._paused_segment = self._new_local_segment()
-                self._paused_segment.input_finalized = True
-                logger.debug(
-                    "SpatialReal avatar input finalized while playback paused",
-                    extra={"source": source},
-                )
-                return True
-
-            if self._active_req_id is None:
-                return False
-
-            async with self._segment_finalize_lock:
-                active_req_id = self._active_req_id
-                if active_req_id is None:
-                    return False
-
-                self._cancel_active_segment_idle_end()
-                req_id = await self._send_provider_audio(
-                    audio=b"",
-                    end=True,
-                    clear_generation=clear_generation,
-                )
-                finalized_events_trusted = not self._reactivate_request_id(req_id)
-                if req_id != active_req_id:
-                    logger.warning(
-                        "Avatar request ID changed while finalizing segment",
-                        extra={"expected": active_req_id, "actual": req_id, "source": source},
-                    )
-
-                self._active_req_id = None
-                active_segment = self._segments.pop(active_req_id, None)
-                segment = self._segments.get(req_id)
-
-                if active_segment is None and segment is None:
-                    return True
-                if segment is None:
-                    if active_segment is None:
-                        return True
-                    active_segment.req_id = req_id
-                    segment = active_segment
-                    self._segments[req_id] = segment
-                elif active_segment is not None and segment is not active_segment:
-                    self._merge_segment_state(segment, active_segment)
-
-                segment.input_finalized = True
-                segment.provider_events_trusted = segment.provider_events_trusted and finalized_events_trusted
-                self._consume_early_provider_events(segment)
-                self._mark_segment_waiting_for_completion(segment)
-                return True
-
-    def _mark_segment_waiting_for_completion(self, segment: _SegmentState) -> None:
-        if segment.req_id not in self._pending_segment_ids:
-            self._pending_segment_ids.append(segment.req_id)
-
-        # a provider completion that arrived before local finalization is
-        # preserved (not dropped): apply it now
-        if segment.provider_playback_completed:
-            self._complete_segment(
-                req_id=segment.req_id,
-                interrupted=False,
-                reason="provider_end_deferred",
-            )
-            return
-
-        self._schedule_segment_completion(segment)
-
-    def _schedule_segment_completion(self, segment: _SegmentState) -> None:
-        if segment.completion_timeout_task and not segment.completion_timeout_task.done():
-            segment.completion_timeout_task.cancel()
-
-        timeout = self._compute_completion_timeout(segment)
-        segment.completion_timeout_task = asyncio.create_task(
-            self._wait_for_segment_completion_timeout(segment.req_id, timeout),
-            name=f"spatialreal_segment_timeout_{segment.req_id}",
-        )
-
-    @staticmethod
-    def _compute_completion_timeout(segment: _SegmentState) -> float:
-        if segment.playback_started_at is not None:
-            expected_playback_end = segment.playback_started_at + segment.attempt_duration
-            remaining_playback = max(0.0, expected_playback_end - time.time())
-            return max(
-                MIN_COMPLETION_TIMEOUT_SECONDS,
-                remaining_playback + LIVEKIT_ACTIVITY_COMPLETION_BUFFER_SECONDS,
-            )
-
-        if segment.first_frame_at is None:
-            return MIN_COMPLETION_TIMEOUT_SECONDS
-
-        expected_playback_end = segment.first_frame_at + segment.attempt_duration
-        remaining_playback = max(0.0, expected_playback_end - time.time())
-        return max(
-            MIN_COMPLETION_TIMEOUT_SECONDS,
-            remaining_playback + LIVEKIT_ACTIVITY_START_WAIT_SECONDS,
-        )
-
-    async def _wait_for_segment_completion_timeout(self, req_id: str, timeout: float) -> None:
-        try:
-            await asyncio.sleep(timeout)
-        except asyncio.CancelledError:
-            return
-
-        segment = self._segments.get(req_id)
-        if segment is None:
-            return
-
-        # the server is holding playback; resume reschedules against the shifted start
-        if segment.native_paused_at is not None:
-            return
-
-        # if the avatar is still audibly speaking, allow a bounded overrun
-        # before declaring the segment finished
-        if segment.playback_started_at is not None and self._avatar_is_speaking:
-            expected_end = segment.playback_started_at + segment.attempt_duration
-            if time.time() < expected_end + LIVEKIT_ACTIVITY_MAX_OVERRUN_SECONDS:
-                segment.completion_timeout_task = asyncio.create_task(
-                    self._wait_for_segment_completion_timeout(req_id, LIVEKIT_ACTIVITY_RECHECK_SECONDS),
-                    name=f"spatialreal_segment_activity_wait_{req_id}",
-                )
-                return
-
-        playback_observed = segment.playback_started_at is not None
-        reason = "livekit_activity_duration" if playback_observed else "timeout_no_playback_signal"
-        if self._complete_segment(req_id=req_id, interrupted=False, reason=reason):
-            if playback_observed:
-                logger.debug(
-                    "SpatialReal avatar completion derived from observed LiveKit playback",
-                    extra={
-                        "request_id": req_id,
-                        "playback_start_source": segment.playback_start_source,
-                        "pushed_duration": segment.pushed_duration,
-                    },
-                )
-            else:
-                logger.warning(
-                    "Avatar segment received no provider or LiveKit playback signal; using duration fallback",
-                    extra={"request_id": req_id, "timeout": timeout},
-                )
-
-    def _on_playback_state(self, event: PlaybackStateEvent) -> None:
-        # Structured server-side playback state (egress playback_control). The
-        # PLAYING/PAUSED/ENDED signals are already handled via on_playback
-        # (ServerResponseAnimation); the one thing that path can't express is a
-        # server-forced interrupt of a held pause — surface that here so the
-        # framework's speech handle isn't left hanging on a segment the server
-        # has abandoned.
-        if event.state != PlaybackState.INTERRUPTED:
-            return
-        if event.reason != InterruptReason.PAUSE_TIMEOUT:
-            # explicit / preempted interrupts already flow through the framework's
-            # own clear_buffer path; nothing extra to do.
-            return
-        logger.warning(
-            "SpatialReal avatar pause timed out on the server; finalizing segment as interrupted",
-            extra={"request_id": event.req_id, "played_ms": event.played_ms},
-        )
-        self._discard_requested = True
-        self._pause_requested = False
-        self._spawn_background_task(
-            self._handle_interrupt(),
-            name="spatialreal_avatar_pause_timeout",
-        )
-
-    def _on_playback_signal(self, signal: PlaybackSignal) -> None:
-        req_id = signal.req_id or None
-        is_last = signal.end
-        if req_id is not None and req_id in self._recently_completed_req_ids:
-            logger.debug(
-                "Ignoring duplicate provider event for completed request",
-                extra={"request_id": req_id, "is_last": is_last},
-            )
-            return
-        if req_id is not None:
-            segment = self._segments.get(req_id)
-            if segment is not None and not segment.provider_events_trusted:
-                logger.debug(
-                    "Ignoring ambiguous provider event for a reused request ID",
-                    extra={"request_id": req_id, "is_last": is_last},
-                )
-                return
-            if segment is None:
-                self._early_provider_started_ids.add(req_id)
-            else:
-                self._mark_playback_started(segment, source="spatialreal_transport_frame")
-
-            if not is_last:
-                return
-
-            if segment is None:
-                self._early_provider_completed_ids.add(req_id)
-                logger.debug(
-                    "Preserving provider completion received before local segment creation",
-                    extra={"request_id": req_id},
-                )
-                return
-
-            segment.provider_playback_completed = True
-            if req_id not in self._pending_segment_ids:
-                logger.debug(
-                    "Deferring provider completion until local segment finalization",
-                    extra={"request_id": req_id},
-                )
-                return
-
-            if not self._complete_segment(req_id=req_id, interrupted=False, reason="provider_end"):
-                logger.debug("Completion event for unknown request", extra={"request_id": req_id})
-            return
-
-        if not is_last:
-            return
-
-        if self._pending_segment_ids:
-            fallback_req_id = self._pending_segment_ids[0]
-            if self._complete_segment(
-                req_id=fallback_req_id,
-                interrupted=False,
-                reason="provider_end_fallback",
-            ):
-                logger.warning(
-                    "Avatar completion event missing request ID; matched oldest pending segment",
-                    extra={"request_id": fallback_req_id},
-                )
-            return
-
-        if self._active_req_id is not None:
-            active_segment = self._segments.get(self._active_req_id)
-            if active_segment is not None:
-                self._mark_playback_started(active_segment, source="spatialreal_transport_frame")
-                active_segment.provider_playback_completed = True
-                logger.warning(
-                    "Avatar completion event missing request ID; deferred against active segment",
-                    extra={"request_id": self._active_req_id},
-                )
-
-    def _is_avatar_output_participant(self, participant: rtc.Participant) -> bool:
-        if participant.identity == self._avatar_participant_identity:
-            return True
-
-        represented_identity = self._represented_participant_identity
-        if represented_identity is None:
-            return False
-
-        attributes = getattr(participant, "attributes", {}) or {}
-        return attributes.get(ATTRIBUTE_PUBLISH_ON_BEHALF) == represented_identity
-
-    def _on_active_speakers_changed(self, speakers: list[rtc.Participant]) -> None:
-        avatar_is_speaking = any(self._is_avatar_output_participant(speaker) for speaker in speakers)
-        if avatar_is_speaking == self._avatar_is_speaking:
-            return
-
-        self._avatar_is_speaking = avatar_is_speaking
-        logger.debug(
-            "SpatialReal avatar LiveKit speaking state changed",
-            extra={
-                "is_speaking": avatar_is_speaking,
-                "active_speaker_identities": [speaker.identity for speaker in speakers],
-            },
-        )
-        if not avatar_is_speaking or self._playback_observation_suspended():
-            return
-
-        segment = self._current_observable_segment()
-        if segment is not None:
-            self._mark_playback_started(segment, source="livekit_active_speaker")
-
-    def _playback_observation_suspended(self) -> bool:
-        # SpatialReal 1.7.1 correction: an egress tail that is draining while
-        # paused is not the start of the resumed attempt.
-        return self._pause_requested or self._paused_segment is not None
-
-    def _on_track_published(
-        self,
-        publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
-    ) -> None:
-        # rooms configured without auto-subscribe never fire track_subscribed
-        # unless we opt in explicitly
-        if publication.kind == rtc.TrackKind.KIND_AUDIO and self._is_avatar_output_participant(participant):
-            publication.set_subscribed(True)
-
-    def _on_track_subscribed(
-        self,
-        track: rtc.Track,
-        publication: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
-    ) -> None:
-        if track.kind != rtc.TrackKind.KIND_AUDIO or not self._is_avatar_output_participant(participant):
-            return
-
-        self._start_avatar_audio_monitor(track)
-        logger.debug(
-            "SpatialReal avatar LiveKit audio track subscribed",
-            extra={
-                "participant_identity": participant.identity,
-                "track_sid": publication.sid,
-            },
-        )
-
-    def _on_track_unsubscribed(
-        self,
-        track: rtc.Track,
-        _: rtc.RemoteTrackPublication,
-        participant: rtc.RemoteParticipant,
-    ) -> None:
-        if track.kind == rtc.TrackKind.KIND_AUDIO and self._is_avatar_output_participant(participant):
-            self._stop_avatar_audio_monitor()
-
-    def _start_avatar_audio_monitor(self, track: rtc.Track) -> None:
-        if self._avatar_audio_monitor_task and not self._avatar_audio_monitor_task.done():
-            return
-
-        self._avatar_audio_stream = rtc.AudioStream(track, capacity=10)
-        self._avatar_audio_monitor_task = asyncio.create_task(
-            self._monitor_avatar_audio(),
-            name="spatialreal_avatar_audio_monitor",
-        )
-
-    def _stop_avatar_audio_monitor(self) -> None:
-        if self._avatar_audio_monitor_task and not self._avatar_audio_monitor_task.done():
-            self._avatar_audio_monitor_task.cancel()
-        self._avatar_audio_monitor_task = None
-
-        if self._avatar_audio_stream is not None:
-            self._spawn_background_task(
-                self._avatar_audio_stream.aclose(),
-                name="spatialreal_avatar_audio_stream_close",
-            )
-        self._avatar_audio_stream = None
-
-    async def _monitor_avatar_audio(self) -> None:
-        stream = self._avatar_audio_stream
-        if stream is None:
-            return
-
-        try:
-            async for event in stream:
-                self._on_avatar_audio_frame(event.frame)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.warning("SpatialReal avatar audio monitor failed", exc_info=True)
-
-    def _current_observable_segment(self) -> _SegmentState | None:
-        if self._paused_segment is not None:
-            return self._paused_segment
-        if self._pending_segment_ids:
-            segment = self._segments.get(self._pending_segment_ids[0])
-            if segment is not None:
-                return segment
-        if self._active_req_id is not None:
-            return self._segments.get(self._active_req_id)
-        return None
-
-    def _on_avatar_audio_frame(self, frame: rtc.AudioFrame) -> None:
-        if self._playback_observation_suspended():
-            return
-        segment = self._current_observable_segment()
-        if segment is None or segment.playback_started:
-            return
-
-        if not self._frame_has_audible_audio(frame):
-            return
-
-        self._mark_playback_started(segment, source="livekit_avatar_audio_track")
-
-    @staticmethod
-    def _frame_has_audible_audio(frame: rtc.AudioFrame) -> bool:
-        threshold = AVATAR_AUDIO_ACTIVITY_THRESHOLD
-        for sample in frame.data:
-            if sample >= threshold or sample <= -threshold:
-                return True
-        return False
-
-    def _mark_playback_started(self, segment: _SegmentState, *, source: str) -> None:
-        if segment.playback_started:
-            return
-
-        segment.playback_started = True
-        segment.playback_started_at = time.time()
-        segment.playback_start_source = source
-        if self._audio_buffer:
-            self._audio_buffer.notify_playback_started()
-        if segment.req_id in self._pending_segment_ids:
-            self._schedule_segment_completion(segment)
-        logger.debug(
-            "SpatialReal avatar playback started",
-            extra={"request_id": segment.req_id, "source": source},
-        )
-        self.emit(
-            "playback_started",
-            AvatarPlaybackStartedEvent(
-                request_id=segment.req_id,
-                source=source,
-                observed_at=segment.playback_started_at,
-            ),
-        )
-        if self._provider_recovery_pending_playback:
-            self._provider_recovery_pending_playback = False
-            self._provider_connection_state = "recovered"
-            logger.info(
-                "SpatialReal provider recovery confirmed by observed avatar playback",
-                extra={
-                    "request_id": segment.req_id,
-                    "source": source,
-                    "generation": self._provider_session_generation,
-                },
-            )
-            self._emit_provider_connection_state(
-                state="recovered",
-                reason=f"playback_observed:{source}",
-                attempt=0,
-            )
-
-    def _complete_segment(self, *, req_id: str, interrupted: bool, reason: str) -> bool:
-        segment = self._segments.pop(req_id, None)
-        if segment is None:
-            return False
-
-        self._early_provider_started_ids.discard(req_id)
-        self._early_provider_completed_ids.discard(req_id)
-        self._recently_completed_req_ids.append(req_id)
-
-        self._pending_segment_ids = deque(
-            pending_req_id for pending_req_id in self._pending_segment_ids if pending_req_id != req_id
-        )
-
-        if segment.completion_timeout_task and not segment.completion_timeout_task.done():
-            segment.completion_timeout_task.cancel()
-
-        if self._active_req_id == req_id:
-            self._active_req_id = None
-            self._cancel_active_segment_idle_end()
-
-        playback_position = (
-            self._estimate_interrupted_playback_position(segment) if interrupted else segment.pushed_duration
-        )
-
-        if self._audio_buffer:
-            # with wait_playback_start the framework only sees playback_started
-            # when we notify it; guarantee started precedes finished even if no
-            # playback signal was ever observed
-            if not segment.playback_started:
-                self._audio_buffer.notify_playback_started()
-            self._audio_buffer.notify_playback_finished(
-                playback_position=playback_position,
-                interrupted=interrupted,
-            )
-
-        logger.debug(
-            "SpatialReal avatar segment playback completed",
-            extra={
-                "request_id": req_id,
-                "reason": reason,
-                "interrupted": interrupted,
-                "playback_position": playback_position,
-                "pushed_duration": segment.pushed_duration,
-                "playback_start_source": segment.playback_start_source,
-                "provider_playback_completed": segment.provider_playback_completed,
-            },
-        )
-        return True
-
-    @staticmethod
-    def _estimate_interrupted_playback_position(segment: _SegmentState) -> float:
-        # Sending frames to SpatialReal does not mean the avatar has played
-        # them. Before an observed playback-start signal, resume from the last
-        # confirmed position so an early false interruption cannot skip audio.
-        anchor = segment.playback_started_at
-        if anchor is None:
-            return min(segment.pushed_duration, segment.playback_position_offset)
-
-        elapsed = max(0.0, time.time() - anchor)
-        return min(segment.pushed_duration, segment.playback_position_offset + elapsed)
-
-    def _complete_all_segments(self, *, interrupted: bool, reason: str) -> None:
-        self._complete_paused_segment(interrupted=interrupted, reason=reason)
-        for req_id in list(self._segments.keys()):
-            self._complete_segment(req_id=req_id, interrupted=interrupted, reason=reason)
-
-        self._active_req_id = None
-        self._cancel_active_segment_idle_end()
-        self._pending_segment_ids.clear()
-        self._early_provider_started_ids.clear()
-        self._early_provider_completed_ids.clear()
-        self._avatar_is_speaking = False
-        self._paused_segment = None
-        self._pause_requested = False
-        self._pause_requested_at = None
-        self._discard_requested = False
-
-    def _new_local_segment(self) -> _SegmentState:
-        self._local_segment_sequence += 1
-        return _SegmentState(req_id=f"local-pending-{self._local_segment_sequence}")
-
-    @staticmethod
-    def _merge_segment_state(target: _SegmentState, source: _SegmentState) -> None:
-        """Preserve retained audio and lifecycle state across provider ID rollover."""
-        target.pushed_duration = max(target.pushed_duration, source.pushed_duration)
-        target.attempt_duration = max(target.attempt_duration, source.attempt_duration)
-        target.playback_position_offset = max(
-            target.playback_position_offset,
-            source.playback_position_offset,
-        )
-        target.input_finalized = target.input_finalized or source.input_finalized
-        target.provider_events_trusted = target.provider_events_trusted and source.provider_events_trusted
-
-        if source.buffered_duration > target.buffered_duration:
-            target.audio_frames = deque(source.audio_frames)
-            target.buffered_duration = source.buffered_duration
-            target.buffer_start_position = source.buffer_start_position
-
-        if target.first_frame_at is None:
-            target.first_frame_at = source.first_frame_at
-        target.playback_started = target.playback_started or source.playback_started
-        target.provider_playback_completed = target.provider_playback_completed or source.provider_playback_completed
-        if target.playback_started_at is None:
-            target.playback_started_at = source.playback_started_at
-            target.playback_start_source = source.playback_start_source
-
-    def _complete_paused_segment(self, *, interrupted: bool, reason: str) -> bool:
-        segment = self._paused_segment
-        if segment is None:
-            return False
-
-        self._paused_segment = None
-        req_id = segment.req_id
-        existing = self._segments.get(req_id)
-        if existing is not None and existing is not segment:
-            self._merge_segment_state(existing, segment)
-            segment = existing
-        else:
-            self._segments[req_id] = segment
-        return self._complete_segment(
-            req_id=segment.req_id,
-            interrupted=interrupted,
-            reason=reason,
-        )
-
-    def _on_pause(self) -> None:
-        if self._closing or self._drop_frames_until_segment_end:
-            return
-        self._discard_requested = False
-        if (
-            self._server_playback_control
-            and self._paused_segment is None
-            and self._current_observable_segment() is not None
-        ):
-            # Native path: the server holds its send cursor and keeps ingesting,
-            # so we must NOT set _pause_requested (which diverts/retains frames)
-            # — audio keeps flowing to the same request untouched.
-            # With no audio sent yet (the reply is still in llm/tts) the server has
-            # nothing to hold, so the first frames are held here like the emulated path.
-            self._spawn_background_task(
-                self._handle_pause_native(),
-                name="spatialreal_avatar_pause_native",
-            )
-            return
-        self._pause_requested = True
-        self._pause_requested_at = time.time()
-        self._spawn_background_task(
-            self._handle_pause(),
-            name="spatialreal_avatar_pause",
-        )
-
-    def _on_resume(self) -> None:
-        if self._closing or self._drop_frames_until_segment_end:
-            return
-        self._pause_requested = False
-        if self._discard_requested:
-            logger.debug("Ignoring SpatialReal avatar resume after confirmed interruption")
-            return
-        if self._server_playback_control and self._paused_segment is None:
-            # frames held here (see _on_pause) are replayed by the emulated resume
-            self._spawn_background_task(
-                self._handle_resume_native(),
-                name="spatialreal_avatar_resume_native",
-            )
-            return
-        self._spawn_background_task(
-            self._handle_resume(),
-            name="spatialreal_avatar_resume",
-        )
-
-    async def _handle_pause_native(self) -> None:
-        """Server-side pause: hold the cursor, keep the segment and audio flow intact."""
-        if not self._avatarkit_session or self._discard_requested:
-            return
-        async with self._provider_io_lock:
-            if self._discard_requested or self._avatarkit_session is None:
-                return
-            if self._current_observable_segment() is None:
-                # Nothing is playing. The provider's last request is one that already
-                # ended (a confirmed interruption the framework has not caught up with),
-                # and holding it would hold nothing.
-                logger.debug("SpatialReal avatar paused with no audio in flight")
-                return
-            try:
-                req_id = await self._avatarkit_session.pause()
-                logger.debug("SpatialReal avatar playback paused (server-side)", extra={"request_id": req_id})
-            except Exception as e:
-                # Nothing is holding playback: fall back to the emulated path rather than
-                # letting frames keep flowing through the framework's interruption hold.
-                logger.warning(
-                    "Failed to pause SpatialReal avatar playback (server-side); falling back to local pause",
-                    exc_info=e,
-                )
-                self._pause_requested = True
-                self._pause_requested_at = time.time()
-                self._spawn_background_task(
-                    self._handle_pause(),
-                    name="spatialreal_avatar_pause_fallback",
-                )
-                return
-            segment = self._segments.get(req_id) or self._segments.get(self._active_req_id or "")
-            if segment is not None and segment.native_paused_at is None:
-                segment.native_paused_at = time.time()
-
-    async def _handle_resume_native(self) -> None:
-        """Server-side resume: continue the held cursor from where it stopped."""
-        try:
-            if not self._avatarkit_session or self._discard_requested:
-                return
-            async with self._provider_io_lock:
-                if self._discard_requested or self._avatarkit_session is None:
-                    return
-                if self._current_observable_segment() is None:
-                    # Same as pause: no segment means the request to resume already ended.
-                    logger.debug("SpatialReal avatar resumed with no audio in flight")
-                    return
-                try:
-                    req_id = await self._avatarkit_session.resume()
-                    logger.debug(
-                        "SpatialReal avatar playback resumed (server-side)",
-                        extra={"request_id": req_id},
-                    )
-                except Exception as e:
-                    logger.warning("Failed to resume SpatialReal avatar playback (server-side)", exc_info=e)
-        finally:
-            # released on every path (failed resume, resume during a provider
-            # reconnect) so a segment can't be stranded; a hold the server keeps
-            # anyway ends in its pause_timeout interrupt
-            self._release_native_hold()
-
-    def _release_native_hold(self) -> None:
-        """Shift held segments' playback start by the time the server held them."""
-        now = time.time()
-        for segment in self._segments.values():
-            if segment.native_paused_at is None:
-                continue
-            held = now - segment.native_paused_at
-            segment.native_paused_at = None
-            if segment.playback_started_at is not None:
-                segment.playback_started_at += held
-            elif segment.first_frame_at is not None:
-                segment.first_frame_at += held
-            if segment.req_id in self._pending_segment_ids:
-                self._schedule_segment_completion(segment)
-
-    def _on_clear_buffer(self) -> None:
-        if self._closing:
-            return
-        self._clear_generation += 1
-        if self._provider_send_in_flight:
-            # The provider call still owns the I/O lock. Defer the confirmed
-            # interruption until the send returns; if it fails, recovery uses
-            # this same clear as the authoritative sentence boundary.
-            self._clear_during_provider_send = True
-            self._discard_requested = True
-            self._pause_requested = False
-            return
-        if self._provider_recovery_in_flight:
-            # Recovery already owns the provider interrupt. A concurrent clear
-            # is the authoritative framework boundary even if the provider
-            # round trip has not completed yet.
-            self._clear_during_provider_recovery = True
-            self._discard_requested = True
-            self._pause_requested = False
-            return
-        if self._drop_frames_until_segment_end:
-            # LiveKit flushes before clear_buffer on a confirmed
-            # interruption. The clear can drain the queued AudioSegmentEnd,
-            # so it is itself the authoritative boundary for the damaged
-            # segment and must release drop mode for the next response.
-            self._drop_frames_until_segment_end = False
-            return
-        self._discard_requested = True
-        self._pause_requested = False
-        self._spawn_background_task(self._handle_interrupt(), name="spatialreal_avatar_interrupt")
-
-    async def _handle_pause(self) -> None:
-        if not self._avatarkit_session or self._discard_requested:
-            return
-
-        async with self._provider_io_lock:
-            if self._discard_requested or not self._pause_requested:
-                return
-
-            segment = self._current_observable_segment()
-            if segment is None:
-                logger.debug("SpatialReal avatar paused before provider audio started")
-                return
-
-            old_req_id = segment.req_id
-            was_pending = old_req_id in self._pending_segment_ids
-            try:
-                interrupted_id = await self._avatarkit_session.interrupt()
-            except Exception as e:
-                # Keep the original provider request authoritative. The
-                # framework may still emit resume/clear, but new frames must
-                # not be diverted into an orphaned paused segment.
-                self._pause_requested = False
-                self._pause_requested_at = None
-                logger.warning("Failed to pause SpatialReal avatar playback", exc_info=e)
-                return
-
-            segment.playback_position_offset = self._estimate_interrupted_playback_position(segment)
-            segment.input_finalized = segment.input_finalized or was_pending
-            if segment.completion_timeout_task and not segment.completion_timeout_task.done():
-                segment.completion_timeout_task.cancel()
-            self._pending_segment_ids = deque(req_id for req_id in self._pending_segment_ids if req_id != old_req_id)
-            if self._active_req_id == old_req_id:
-                self._active_req_id = None
-            self._cancel_active_segment_idle_end()
-            self._recently_completed_req_ids.append(old_req_id)
-            if interrupted_id != old_req_id:
-                self._recently_completed_req_ids.append(interrupted_id)
-
-            segment.playback_started = False
-            segment.playback_started_at = None
-            segment.playback_start_source = None
-            segment.provider_playback_completed = False
-            segment.first_frame_at = None
-            segment.attempt_duration = 0.0
-            self._paused_segment = segment
-            provider_pause_latency_ms = None
-            if self._pause_requested_at is not None:
-                provider_pause_latency_ms = max(
-                    0.0,
-                    (time.time() - self._pause_requested_at) * 1000.0,
-                )
-
-            logger.debug(
-                "SpatialReal avatar playback paused",
-                extra={
-                    "request_id": old_req_id,
-                    "provider_interrupt_id": interrupted_id,
-                    "playback_position": segment.playback_position_offset,
-                    "pushed_duration": segment.pushed_duration,
-                    "input_finalized": segment.input_finalized,
-                    "provider_pause_latency_ms": provider_pause_latency_ms,
-                },
-            )
-
-    async def _handle_resume(self) -> None:
-        if not self._avatarkit_session or self._discard_requested:
-            return
-
-        clear_generation = self._clear_generation
-        async with self._provider_io_lock:
-            segment = self._paused_segment
-            if (
-                segment is None
-                or self._discard_requested
-                or self._pause_requested
-                or clear_generation != self._clear_generation
-            ):
-                return
-
-            self._pause_requested_at = None
-
-            old_req_id = segment.req_id
-            replay_from = max(
-                segment.playback_position_offset,
-                segment.buffer_start_position,
-            )
-            if replay_from > segment.playback_position_offset:
-                logger.warning(
-                    "SpatialReal resume buffer no longer contains requested playback position",
-                    extra={
-                        "request_id": old_req_id,
-                        "requested_position": segment.playback_position_offset,
-                        "buffer_start_position": segment.buffer_start_position,
-                    },
-                )
-                segment.playback_position_offset = replay_from
-
-            remaining_frames = self._remaining_audio_frames(segment, replay_from)
-            req_id: str | None = None
-            attempt_duration = 0.0
-            provider_events_trusted = True
-            resumed_request_ids: set[str] = set()
-            replay_transmission_started = False
-            try:
-                for frame in remaining_frames:
-                    replay_transmission_started = True
-                    current_req_id = await self._send_provider_audio(
-                        audio=frame.audio,
-                        end=False,
-                        clear_generation=clear_generation,
-                    )
-                    provider_events_trusted = provider_events_trusted and (
-                        current_req_id not in self._recently_completed_req_ids
-                    )
-                    resumed_request_ids.add(current_req_id)
-                    if req_id is not None and current_req_id != req_id:
-                        logger.warning(
-                            "Avatar request ID changed while resuming audio",
-                            extra={"previous": req_id, "current": current_req_id},
-                        )
-                    req_id = current_req_id
-                    attempt_duration += frame.duration
-
-                finalized_req_id: str | None = None
-                if req_id is not None and segment.input_finalized:
-                    finalized_req_id = await self._send_provider_audio(
-                        audio=b"",
-                        end=True,
-                        clear_generation=clear_generation,
-                    )
-                    provider_events_trusted = provider_events_trusted and (
-                        finalized_req_id not in self._recently_completed_req_ids
-                    )
-                    resumed_request_ids.add(finalized_req_id)
-            except Exception as e:
-                logger.warning("Failed to resume SpatialReal avatar playback", exc_info=e)
-                if replay_transmission_started:
-                    try:
-                        await self._avatarkit_session.interrupt()
-                    except Exception:
-                        logger.warning(
-                            "Failed to stop partial SpatialReal resume after provider error",
-                            exc_info=True,
-                        )
-                self._pause_requested = False
-                self._pause_requested_at = None
-                self._complete_paused_segment(
-                    interrupted=True,
-                    reason="resume_provider_error",
-                )
-                return
-
-            if req_id is None:
-                if segment.input_finalized:
-                    self._complete_paused_segment(
-                        interrupted=False,
-                        reason="resume_after_playback_complete",
-                    )
-                else:
-                    # Everything buffered had already played, so there was nothing to
-                    # resend — but the turn is still open. Put the segment back in play so
-                    # the next frame continues it (or rolls it over) instead of leaving it
-                    # stranded beside a fresh request.
-                    self._segments[segment.req_id] = segment
-                    self._active_req_id = segment.req_id
-                    self._paused_segment = None
-                return
-
-            # The provider can reuse request IDs. A delayed completion from the
-            # interrupted attempt is then indistinguishable from the resumed
-            # attempt, so rely on observed avatar playback plus duration for
-            # this attempt instead of trusting ambiguous provider frames.
-            for resumed_request_id in resumed_request_ids:
-                self._reactivate_request_id(resumed_request_id)
-
-            self._segments.pop(old_req_id, None)
-            segment.req_id = finalized_req_id or req_id
-            segment.first_frame_at = time.time()
-            segment.attempt_duration = attempt_duration
-            segment.provider_events_trusted = provider_events_trusted
-            if not provider_events_trusted:
-                logger.warning(
-                    "SpatialReal reused a request ID; provider lifecycle events are disabled for resumed attempt",
-                    extra={"request_id": segment.req_id, "previous_request_id": old_req_id},
-                )
-            existing = self._segments.get(segment.req_id)
-            if existing is not None and existing is not segment:
-                self._merge_segment_state(segment, existing)
-            self._segments[segment.req_id] = segment
-            self._paused_segment = None
-            self._consume_early_provider_events(segment)
-
-            if segment.input_finalized:
-                self._mark_segment_waiting_for_completion(segment)
-            else:
-                self._active_req_id = segment.req_id
-                self._schedule_active_segment_idle_end()
-
-            logger.debug(
-                "SpatialReal avatar playback resumed",
-                extra={
-                    "request_id": segment.req_id,
-                    "previous_request_id": old_req_id,
-                    "replay_from": replay_from,
-                    "remaining_duration": segment.attempt_duration,
-                    "pushed_duration": segment.pushed_duration,
-                    "input_finalized": segment.input_finalized,
-                },
-            )
-
-    async def _handle_interrupt(self) -> None:
-        if not self._avatarkit_session:
-            return
-
-        async with self._interrupt_lock:
-            async with self._provider_io_lock:
-                # Coalesce duplicate clear callbacks once the interrupted turn
-                # has already been finalized.
-                if not self._segments and self._active_req_id is None and self._paused_segment is None:
-                    logger.debug("Ignoring duplicate SpatialReal avatar interrupt")
-                    return
-
-                paused_segment = self._paused_segment
-                interrupted_id = paused_segment.req_id if paused_segment is not None else self._active_req_id
-                if paused_segment is None:
-                    try:
-                        interrupted_id = await self._avatarkit_session.interrupt()
-                    except Exception as e:
-                        # Provider failure must not strand the framework speech
-                        # handle. Finalize local lifecycle state below and let
-                        # diagnostics expose the provider-control failure.
-                        logger.warning("Failed to interrupt SpatialReal avatar", exc_info=e)
-
-                async with self._segment_finalize_lock:
-                    if paused_segment is not None:
-                        self._complete_paused_segment(
-                            interrupted=True,
-                            reason="interrupt_paused",
-                        )
-                    elif interrupted_id is not None:
-                        if (
-                            not self._complete_segment(
-                                req_id=interrupted_id,
-                                interrupted=True,
-                                reason="interrupt",
-                            )
-                            and self._active_req_id is not None
-                        ):
-                            self._complete_segment(
-                                req_id=self._active_req_id,
-                                interrupted=True,
-                                reason="interrupt_fallback",
-                            )
-
-                    for req_id in list(self._segments.keys()):
-                        self._complete_segment(
-                            req_id=req_id,
-                            interrupted=True,
-                            reason="interrupt_remaining",
-                        )
-
-                self._paused_segment = None
-                self._pause_requested_at = None
-                self._discard_requested = False
-                logger.debug("SpatialReal avatar interrupted", extra={"request_id": interrupted_id})
-
-    def _reactivate_request_id(self, req_id: str) -> bool:
-        """Remove a completion tombstone and report provider request-ID reuse."""
-        if req_id not in self._recently_completed_req_ids:
-            return False
-        self._recently_completed_req_ids = deque(
-            [completed_id for completed_id in self._recently_completed_req_ids if completed_id != req_id],
-            maxlen=COMPLETED_REQ_ID_HISTORY,
-        )
-        return True
-
-    def _detach_audio_output(self) -> None:
-        if not self._agent_session or not self._audio_output_attached or self._audio_buffer is None:
-            return
-
-        output = self._agent_session.output
-        if output.audio is self._audio_buffer:
-            # replace_audio_tail fell back to a whole-chain assignment (no
-            # wrappers were present), so restore the whole chain
-            output.audio = self._original_audio_output
-        elif self._resolve_audio_tail(output.audio) is self._audio_buffer:
-            # we were swapped in as the tail under wrapper(s); swap the
-            # original tail back so the closed buffer doesn't linger in the
-            # chain
-            if self._original_audio_tail is not None:
-                output.replace_audio_tail(self._original_audio_tail)
-
-        self._audio_output_attached = False
-
-    async def aclose(self) -> None:
-        async with self._close_lock:
-            if self._closing:
-                return
-            self._closing = True
-
-            if self._room is not None:
-                self._room.off("active_speakers_changed", self._on_active_speakers_changed)
-                self._room.off("track_published", self._on_track_published)
-                self._room.off("track_subscribed", self._on_track_subscribed)
-                self._room.off("track_unsubscribed", self._on_track_unsubscribed)
-                self._room = None
-
-            if self._avatar_audio_monitor_task and not self._avatar_audio_monitor_task.done():
-                self._avatar_audio_monitor_task.cancel()
-                await asyncio.gather(
-                    self._avatar_audio_monitor_task,
-                    return_exceptions=True,
-                )
-            self._avatar_audio_monitor_task = None
-
-            avatar_audio_stream = self._avatar_audio_stream
-            self._avatar_audio_stream = None
-            if avatar_audio_stream is not None:
-                try:
-                    await avatar_audio_stream.aclose()
-                except Exception:
-                    logger.warning(
-                        "Failed to close SpatialReal avatar audio stream",
-                        exc_info=True,
-                    )
-
-            if self._main_task:
-                self._main_task.cancel()
-                try:
-                    await self._main_task
-                except asyncio.CancelledError:
-                    pass
-                self._main_task = None
-
-            current_task = asyncio.current_task()
-            lifecycle_tasks = [task for task in self._background_tasks if task is not current_task and not task.done()]
-            for task in lifecycle_tasks:
-                task.cancel()
-            if lifecycle_tasks:
-                await asyncio.gather(*lifecycle_tasks, return_exceptions=True)
-
-            self._cancel_active_segment_idle_end()
-            self._complete_all_segments(interrupted=True, reason="session_close")
-            self._drop_frames_until_segment_end = False
-            self._provider_send_in_flight = False
-            self._clear_during_provider_send = False
-            self._clear_generation = 0
-            self._provider_recovery_in_flight = False
-            self._clear_during_provider_recovery = False
-            self._provider_reconnect_task = None
-            self._provider_connection_state = "disconnected"
-            self._provider_recovery_pending_playback = False
-            self._provider_terminal_failure = False
-            self._provider_expected_close_generations.clear()
-
-            self._detach_audio_output()
-            self._original_audio_output = None
-            self._original_audio_tail = None
-            self._represented_participant_identity = None
-
-            if self._audio_buffer:
-                await self._audio_buffer.aclose()
-                self._audio_buffer = None
-
-            if self._avatarkit_session:
-                try:
-                    await self._avatarkit_session.close()
-                    logger.debug("SpatialReal avatar session closed")
-                except Exception as e:
-                    logger.warning("Error closing SpatialReal avatar session", exc_info=e)
-                finally:
-                    self._avatarkit_session = None
-
-            # The base class owns what it registered in start(): removing the avatar
-            # participant from the room, unregistering its listeners and cancelling the
-            # join task. It reads _agent_session and _room, so it has to run before the
-            # fields below are cleared.
-            try:
-                await super().aclose()
-            except Exception as e:
-                logger.warning("Error in base avatar session close", exc_info=e)
-
-            self._initialized = False
-            self._agent_session = None
-            self._livekit_egress = None
-            self._resolved_sample_rate = None
+            root = cause
+        message = str(root) or str(error)
+        return f"{type(root).__name__}: {message}" if message else type(root).__name__
