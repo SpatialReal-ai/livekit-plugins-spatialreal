@@ -12,10 +12,10 @@ class ResumableQueueAudioOutput(
     QueueAudioOutput,
     rtc.EventEmitter[Literal["clear_buffer", "pause", "resume"]],
 ):
-    """Queue output that exposes LiveKit's native pause/resume lifecycle.
+    """Queue output that forwards the framework's pause/resume to the avatar.
 
-    SpatialReal performs the provider-side pause emulation. This output only
-    advertises the capability and forwards the framework lifecycle events.
+    Pause is advertised only when the SpatialReal server can hold playback; otherwise
+    the framework falls back to interrupting outright.
     """
 
     def __init__(
@@ -23,25 +23,11 @@ class ResumableQueueAudioOutput(
         *,
         sample_rate: int | None = None,
         wait_playback_start: bool = False,
+        can_pause: bool = False,
     ) -> None:
-        super().__init__(
-            sample_rate=sample_rate,
-            wait_playback_start=wait_playback_start,
-        )
-        self._capabilities = AudioOutputCapabilities(pause=True)
+        super().__init__(sample_rate=sample_rate, wait_playback_start=wait_playback_start)
+        self._capabilities = AudioOutputCapabilities(pause=can_pause)
         self._paused = False
-        self._logical_capture_active = False
-        self._playback_started_notified = False
-
-    async def capture_frame(self, frame: rtc.AudioFrame) -> None:
-        if not self._logical_capture_active:
-            self._logical_capture_active = True
-            self._playback_started_notified = False
-        await super().capture_frame(frame)
-
-    def flush(self) -> None:
-        super().flush()
-        self._logical_capture_active = False
 
     def pause(self) -> None:
         if self._paused:
@@ -58,17 +44,3 @@ class ResumableQueueAudioOutput(
     def clear_buffer(self) -> None:
         self._paused = False
         super().clear_buffer()
-
-    def notify_playback_started(self) -> None:
-        if self._playback_started_notified:
-            return
-        self._playback_started_notified = True
-        super().notify_playback_started()
-
-    def notify_playback_finished(
-        self,
-        playback_position: float,
-        interrupted: bool,
-    ) -> None:
-        super().notify_playback_finished(playback_position, interrupted)
-        self._playback_started_notified = False

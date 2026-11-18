@@ -14,7 +14,7 @@ Starting with 1.7.1, the plugin's major and minor version track the `livekit-age
 release it was validated against (e.g. plugin 1.8.x targets `livekit-agents` 1.8.x). The
 patch number is the plugin's own and may advance independently.
 
-The current release, 1.8.12, is validated against `livekit-agents` 1.8.12.
+The current release, 1.8.13, is validated against `livekit-agents` 1.8.13.
 
 Or install from source:
 
@@ -39,8 +39,6 @@ SPATIALREAL_ENVIRONMENT=
 # SPATIALREAL_ENVIRONMENT.
 SPATIALREAL_CONSOLE_ENDPOINT=
 SPATIALREAL_INGRESS_ENDPOINT=
-# Max seconds of per-response audio retained for false-interruption resume (default 180, min 10)
-SPATIALREAL_RESUME_BUFFER_MAX_SECONDS=
 # TTL (seconds) of the LiveKit room-join token the egress worker uses; must outlive
 # the whole session so mid-session reconnects don't hit an expired token (default 86400)
 SPATIALREAL_LIVEKIT_TOKEN_TTL_SECONDS=
@@ -145,7 +143,7 @@ def _on_playback_started(ev: spatialreal.AvatarPlaybackStartedEvent):
 | Field | Type | Description |
 |-------|------|-------------|
 | `request_id` | `str` | SpatialReal request the playback belongs to |
-| `source` | `str` | Signal that observed the start (e.g. `livekit_avatar_audio_track`) |
+| `source` | `str` | Signal that observed the start (`spatialreal_transport_frame`) |
 | `observed_at` | `float` | Unix timestamp of the observation |
 
 ### `SpatialRealException`
@@ -162,16 +160,16 @@ Exception raised for SpatialReal-related errors.
 ### Interruptions and false-interruption recovery
 
 LiveKit Agents owns turn-taking and interruption decisions; the plugin never adds its own VAD
-or interruption policy. The audio output the plugin installs advertises pause support, so the
-framework's `resume_false_interruption` behaviour (on by default) works with the avatar:
+or interruption policy. Each agent reply is one SpatialReal request, and the SpatialReal server
+reports when it starts playing and when it has played out.
 
-- When the framework detects a possible interruption it calls `pause()`. The plugin stops the
-  current SpatialReal request and retains the unplayed PCM tail locally.
-- If the framework later rejects the interruption (a laugh, a backchannel, a cough), it calls
-  `resume()`. The plugin re-sends only the estimated unplayed remainder as a new request.
-- If the interruption is confirmed, `clear_buffer()` discards the retained audio.
-
-The retained tail is bounded by `SPATIALREAL_RESUME_BUFFER_MAX_SECONDS`.
+- `clear_buffer()` (a confirmed interruption) interrupts the request on the server.
+- When the SpatialReal server can hold playback, the plugin advertises pause support, so the
+  framework's `resume_false_interruption` behaviour (on by default) works with the avatar:
+  `pause()` holds the request on the server and `resume()` continues it from where it stopped.
+  If the server cannot hold playback, the framework interrupts as usual.
+- If the SpatialReal connection drops, the reply that was playing is finished as interrupted
+  and the plugin reconnects with a fresh session.
 
 ## License
 
